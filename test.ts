@@ -1,4 +1,4 @@
-// Unit checks for adviser.ts pure helpers. Run: bun /tmp/adviser-check/test.ts
+// Unit checks for adviser.ts pure helpers. Run: bun test.ts (from the repo root)
 import {
   buildInjection,
   buildPassInput,

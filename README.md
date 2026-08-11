@@ -7,10 +7,10 @@ The main agent gets tunnel vision. Adviser watches what the agent reads and runs
 ## Install
 
 ```bash
-pi install git:github.com/kartikkabadi/pi-adviser
+pi install git:github.com/kartikkabadi/pi-adviser@v0.1.1
 ```
 
-Then restart pi or run `/reload`.
+Then restart pi or run `/reload`. To try it without installing: `pi -e git:github.com/kartikkabadi/pi-adviser`.
 
 ## Usage
 
@@ -38,6 +38,7 @@ Default: the main agent's current model. Debug: `PI_ADVISER_DEBUG=1` logs pass o
 - Pass input: the adviser's own digest (max 700 chars) plus this turn's tool output (2000 chars per result, 9000 total).
 - The adviser model replies with one JSON object: `{"concerns": "...", "digest": "..."}`. Empty concerns means silence.
 - `context`: non-empty concerns are injected once into the next LLM call as a `[adviser]` user message. The main agent answers them.
+- Stale protection: pending concerns are dropped as soon as a newer user message arrives, so the adviser never re-raises questions about superseded work.
 - The adviser never blocks, never interrupts, never delays exit, and has no tools.
 
 ## License
@@ -50,6 +51,8 @@ MIT
 bun test.ts
 ```
 
+Run from the repo root. Requires bun; CI runs this exact command.
+
 ## Packaging notes
 
-`package-lock.json` is intentionally not committed. Pi installs this package with `npm install --omit=dev` and regenerates the lock at install time. The runtime dependencies are the pi-bundled core packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`), supplied by pi's extension loader, so a committed lock would describe copies that pi overrides at runtime. Install reproducibility is pinned by the git tag: `pi install git:github.com/kartikkabadi/pi-adviser@v0.1.0`.
+`package-lock.json` is intentionally not committed. Pi installs this package with `npm install --omit=dev` and regenerates the lock at install time. The runtime dependencies are the pi-bundled core packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`), supplied by pi's extension loader, so a committed lock would describe copies that pi overrides at runtime. Install reproducibility is pinned by the git tag: `pi install git:github.com/kartikkabadi/pi-adviser@v0.1.1`.
