@@ -1,2 +1,3 @@
 node_modules/
+# pi regenerates the lock at install time; installs are pinned by git tag
 package-lock.json

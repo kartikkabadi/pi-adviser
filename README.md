@@ -49,3 +49,7 @@ MIT
 ```bash
 bun test.ts
 ```
+
+## Packaging notes
+
+`package-lock.json` is intentionally not committed. Pi installs this package with `npm install --omit=dev` and regenerates the lock at install time. The runtime dependencies are the pi-bundled core packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`), supplied by pi's extension loader, so a committed lock would describe copies that pi overrides at runtime. Install reproducibility is pinned by the git tag: `pi install git:github.com/kartikkabadi/pi-adviser@v0.1.0`.
