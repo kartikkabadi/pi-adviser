@@ -14,13 +14,15 @@ Then restart pi or run `/reload`. To try it without installing: `pi -e git:githu
 
 ## Usage
 
-Auto-on once installed. The switch:
+On at the start of every session. The switch:
 
 ```
-/adviser on|off|status
+/adviser on
+/adviser off
+/adviser      # toggles, then shows whether it is on or off
 ```
 
-A widget above the editor shows adviser state: reviewing, nothing to flag, or flagged with the note.
+Turning it off lasts only for the current session; a new session starts with it on again. A widget above the editor shows adviser state: reviewing, nothing to flag, or flagged with the note.
 
 ## Config
 

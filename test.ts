@@ -1,5 +1,6 @@
 // Unit checks for adviser.ts pure helpers. Run: bun test.ts (from the repo root)
 import {
+  applyCommand,
   buildInjection,
   buildPassInput,
   isStale,
@@ -183,6 +184,14 @@ check(
   isStale([{ role: "toolResult", timestamp: 999 }, { role: "user", timestamp: 100 }], 200),
   false,
 );
+
+// applyCommand - the /adviser switch
+check("on enables", applyCommand(false, "on"), true);
+check("off disables", applyCommand(true, "off"), false);
+check("bare toggles on->off", applyCommand(true, ""), false);
+check("bare toggles off->on", applyCommand(false, ""), true);
+check("case and spaces ignored", applyCommand(false, "  ON "), true);
+check("unknown args toggle", applyCommand(false, "status"), true);
 
 // Surrogate pair safety: truncating an emoji must not split the pair.
 // (Kept above the summary/exit so these checks actually run.)

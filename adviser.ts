@@ -7,7 +7,7 @@
  * its own rolling digest (what it flagged before) plus the new tool output.
  *
  * Usage:
- *   - Installed: auto-on. /adviser on|off|status
+ *   - Installed: on at the start of every session. /adviser on|off - bare /adviser toggles.
  *   - Config: PI_ADVISER_MODEL="provider/id" to pick a different model
  *     (default: the main agent's current model).
  *   - Debug: PI_ADVISER_DEBUG=1 logs pass outcomes to stderr.
@@ -157,6 +157,14 @@ export function buildInjection(concerns: string): Record<string, unknown> {
   };
 }
 
+/** Resolve the new enabled state from a /adviser argument. Exported for tests. */
+export function applyCommand(state: boolean, arg: string): boolean {
+  const a = arg.trim().toLowerCase();
+  if (a === "on") return true;
+  if (a === "off") return false;
+  return !state; // bare /adviser toggles
+}
+
 // ---------------------------------------------------------------------------
 // Extension logic.
 // ---------------------------------------------------------------------------
@@ -248,6 +256,7 @@ async function runPass(ctx: ExtensionContext, input: string, stamp: number): Pro
 export default function (pi: ExtensionAPI): void {
   // New session (or reload): the adviser memory is per-conversation.
   pi.on("session_start", () => {
+    enabled = true; // always on at the start of a session; off never persists across sessions
     digest = "";
     pendingConcerns = null;
     pendingStamp = 0;
@@ -293,28 +302,22 @@ export default function (pi: ExtensionAPI): void {
     return { messages: [...event.messages, buildInjection(concerns)] };
   });
 
-  // The on/off switch.
+  // The on/off switch. Bare /adviser toggles; on/off set explicitly.
   pi.registerCommand("adviser", {
-    description: "Adviser: on, off, or status (default)",
+    description: "Adviser: on, off, or toggle",
     handler: async (args: string | undefined, ctx: ExtensionCommandContext) => {
-      const arg = (args ?? "").trim().toLowerCase();
-      if (arg === "on") {
-        enabled = true;
-        setWidget(ctx, ["adviser: on"]);
-        ctx.ui.notify("Adviser on", "info");
-      } else if (arg === "off") {
-        enabled = false;
+      const on = applyCommand(enabled, args ?? "");
+      if (!on) {
         pendingConcerns = null;
         pendingStamp = 0;
+      }
+      enabled = on;
+      if (enabled) {
+        setWidget(ctx, ["adviser: on"]);
+        ctx.ui.notify("Adviser on", "info");
+      } else {
         setWidget(ctx, []);
         ctx.ui.notify("Adviser off", "info");
-      } else {
-        const model = MODEL_OVERRIDE || ctx.model?.id || "unknown";
-        const note = pendingConcerns ? ` - flag pending` : "";
-        ctx.ui.notify(
-          `Adviser ${enabled ? "on" : "off"} - model: ${model} - digest: ${digest.length} chars${note}`,
-          "info",
-        );
       }
     },
   });
