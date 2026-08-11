@@ -1,0 +1,14 @@
+{
+  "name": "pi-adviser",
+  "version": "0.1.0",
+  "description": "Lean second-opinion reviewer for the pi coding agent. Watches tool activity, asks the main agent sharp questions. One small model call per turn.",
+  "keywords": ["pi-package", "pi-extension", "adviser", "review"],
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./adviser.ts"]
+  }
+}
