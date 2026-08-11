@@ -262,6 +262,7 @@ export default function (pi: ExtensionAPI): void {
     pendingStamp = 0;
     passing = false;
     shutdown = false;
+    syncAdviserCommand(); // reflect the (always-on) state in the command list
   });
 
   // Session ending: stop touching ctx; the adviser never delays or blocks exit.
@@ -303,22 +304,29 @@ export default function (pi: ExtensionAPI): void {
   });
 
   // The on/off switch. Bare /adviser toggles; on/off set explicitly.
-  pi.registerCommand("adviser", {
-    description: "Adviser: on, off, or toggle",
-    handler: async (args: string | undefined, ctx: ExtensionCommandContext) => {
-      const on = applyCommand(enabled, args ?? "");
-      if (!on) {
-        pendingConcerns = null;
-        pendingStamp = 0;
-      }
-      enabled = on;
-      if (enabled) {
-        setWidget(ctx, ["adviser: on"]);
-        ctx.ui.notify("Adviser on", "info");
-      } else {
-        setWidget(ctx, []);
-        ctx.ui.notify("Adviser off", "info");
-      }
-    },
-  });
+  // Re-registered on every state change so the command list shows the live
+  // state ("Adviser: on" / "Adviser: off") instead of a static description.
+  const adviserHandler = async (args: string | undefined, ctx: ExtensionCommandContext) => {
+    const on = applyCommand(enabled, args ?? "");
+    if (!on) {
+      pendingConcerns = null;
+      pendingStamp = 0;
+    }
+    enabled = on;
+    if (enabled) {
+      setWidget(ctx, ["adviser: on"]);
+      ctx.ui.notify("Adviser on", "info");
+    } else {
+      setWidget(ctx, []);
+      ctx.ui.notify("Adviser off", "info");
+    }
+    syncAdviserCommand();
+  };
+  const syncAdviserCommand = (): void => {
+    pi.registerCommand("adviser", {
+      description: `Adviser: ${enabled ? "on" : "off"}`,
+      handler: adviserHandler,
+    });
+  };
+  syncAdviserCommand();
 }
