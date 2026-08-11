@@ -184,11 +184,12 @@ check(
   false,
 );
 
-console.log(failed === 0 ? "\nALL PASS" : `\n${failed} FAILED`);
-process.exit(failed === 0 ? 0 : 1);
-
 // Surrogate pair safety: truncating an emoji must not split the pair.
+// (Kept above the summary/exit so these checks actually run.)
 const emoji = "a".repeat(3) + "😀" + "b".repeat(20);
 const cut = truncate(emoji, 6);
 check("truncate does not split surrogate pairs", /[\uD800-\uDBFF]$/.test(cut), false);
 check("truncate keeps valid emoji", cut.includes("😀"), true);
+
+console.log(failed === 0 ? "\nALL PASS" : `\n${failed} FAILED`);
+process.exit(failed === 0 ? 0 : 1);
