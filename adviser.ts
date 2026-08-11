@@ -15,6 +15,8 @@
  * Design rules:
  *   - Never blocks or interrupts the main agent.
  *   - One pass per turn, only when the turn had tool results.
+ *   - No stale injections: each pass is stamped with its turn's end time;
+ *     delivery is dropped once a newer user message has arrived.
  *   - Silence is the default: the adviser speaks only when something matters.
  */
 import type {
@@ -58,6 +60,7 @@ Reply with exactly one JSON object and no other text:
 let enabled = true;
 let digest = ""; // adviser memory: what it flagged, what is open
 let pendingConcerns: string | null = null; // advice waiting for the next LLM call
+let pendingStamp = 0; // turn-end time of the turn the pending pass reviewed
 let passing = false; // coalescing: skip turns while a pass is in flight
 let shutdown = false; // session is being torn down; stop touching ctx
 
@@ -119,11 +122,37 @@ export function parseAdviserOutput(text: string): { concerns: string; digest: st
   return { concerns: truncate(cleaned, CONCERNS_MAX_CHARS), digest: "" };
 }
 
+/** Newest user-message timestamp in a message list; 0 when none. Exported for tests. */
+export function newestUserTimestamp(
+  messages: { role?: string; timestamp?: number | string }[],
+): number {
+  let newest = 0;
+  for (const m of messages) {
+    if (m.role !== "user") continue;
+    const t = typeof m.timestamp === "number" ? m.timestamp : Date.parse(String(m.timestamp)) || 0;
+    if (t > newest) newest = t;
+  }
+  return newest;
+}
+
+/**
+ * True when a newer user message arrived after the reviewed turn ended -
+ * the pending advice is stale and must not be injected. Exported for tests.
+ */
+export function isStale(messages: { role?: string; timestamp?: number | string }[], stamp: number): boolean {
+  return newestUserTimestamp(messages) > stamp;
+}
+
 /** Build the injected context message. Exported for tests. */
 export function buildInjection(concerns: string): Record<string, unknown> {
   return {
     role: "user",
-    content: [{ type: "text", text: `[adviser] ${concerns}` }],
+    content: [
+      {
+        type: "text",
+        text: `[adviser] Note from a review of earlier tool activity (not the user's current instruction): ${concerns}`,
+      },
+    ],
     timestamp: Date.now(),
   };
 }
@@ -160,7 +189,7 @@ function setWidget(ctx: ExtensionContext, lines: string[]): void {
   }
 }
 
-async function runPass(ctx: ExtensionContext, input: string): Promise<void> {
+async function runPass(ctx: ExtensionContext, input: string, stamp: number): Promise<void> {
   try {
     const model = resolveModel(ctx);
     if (!model) {
@@ -198,6 +227,7 @@ async function runPass(ctx: ExtensionContext, input: string): Promise<void> {
     if (result.digest) digest = result.digest;
     if (result.concerns) {
       pendingConcerns = result.concerns;
+      pendingStamp = stamp;
       setWidget(ctx, [
         "adviser: flagged - questions will reach the agent",
         truncate(pendingConcerns, 160),
@@ -220,6 +250,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_start", () => {
     digest = "";
     pendingConcerns = null;
+    pendingStamp = 0;
     passing = false;
     shutdown = false;
   });
@@ -239,15 +270,23 @@ export default function (pi: ExtensionAPI): void {
     }
     if (entries.length === 0) return;
     passing = true;
+    const stamp = Date.now(); // the turn this pass reviews
     const input = buildPassInput(digest, entries);
-    void runPass(ctx, input).finally(() => {
+    void runPass(ctx, input, stamp).finally(() => {
       passing = false;
     });
   });
 
   // Delivery: the next LLM call sees the pending advice once, then it clears.
+  // Stale advice is dropped: if a newer user message has arrived since the
+  // reviewed turn ended, the agent has moved on. Silence is the default.
   pi.on("context", (event, ctx: ExtensionContext) => {
     if (!pendingConcerns) return;
+    if (isStale(event.messages, pendingStamp)) {
+      pendingConcerns = null;
+      log("dropped stale concerns (user moved on)");
+      return;
+    }
     const concerns = pendingConcerns;
     pendingConcerns = null;
     log("delivered to next LLM call");
@@ -266,6 +305,7 @@ export default function (pi: ExtensionAPI): void {
       } else if (arg === "off") {
         enabled = false;
         pendingConcerns = null;
+        pendingStamp = 0;
         setWidget(ctx, []);
         ctx.ui.notify("Adviser off", "info");
       } else {

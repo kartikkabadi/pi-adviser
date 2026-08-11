@@ -2,6 +2,8 @@
 import {
   buildInjection,
   buildPassInput,
+  isStale,
+  newestUserTimestamp,
   parseAdviserOutput,
   toolResultText,
   truncate,
@@ -81,7 +83,62 @@ check("concerns capped at 900 chars", longConcerns.concerns.length <= 900, true)
 // buildInjection
 const inj = buildInjection("check Y") as { role: string; content: { type: string; text: string }[] };
 check("injection is user role", inj.role, "user");
-check("injection prefixes adviser", inj.content[0].text, "[adviser] check Y");
+check(
+  "injection prefixes adviser and marks earlier review",
+  inj.content[0].text,
+  "[adviser] Note from a review of earlier tool activity (not the user's current instruction): check Y",
+);
+check("injection text contains the concerns", inj.content[0].text.includes("check Y"), true);
+
+// newestUserTimestamp
+check("newestUserTimestamp empty", newestUserTimestamp([]), 0);
+check(
+  "newestUserTimestamp picks newest user",
+  newestUserTimestamp([
+    { role: "assistant", timestamp: 100 },
+    { role: "user", timestamp: 200 },
+    { role: "user", timestamp: 300 },
+  ]),
+  300,
+);
+check(
+  "newestUserTimestamp ignores non-user roles",
+  newestUserTimestamp([
+    { role: "assistant", timestamp: 999 },
+    { role: "toolResult", timestamp: 998 },
+  ]),
+  0,
+);
+check(
+  "newestUserTimestamp parses ISO strings",
+  newestUserTimestamp([{ role: "user", timestamp: "2026-08-11T10:05:40.308Z" }]),
+  Date.parse("2026-08-11T10:05:40.308Z"),
+);
+check("newestUserTimestamp handles missing timestamp", newestUserTimestamp([{ role: "user" }]), 0);
+
+// isStale - the actual drop decision used in the context hook
+check("isStale false when no user message after stamp", isStale([{ role: "user", timestamp: 100 }], 200), false);
+check("isStale true when newer user message arrived", isStale([{ role: "user", timestamp: 300 }], 200), true);
+check("isStale ignores assistant messages", isStale([{ role: "assistant", timestamp: 300 }], 200), false);
+check("isStale handles ISO string timestamps", isStale([{ role: "user", timestamp: "2026-08-11T10:05:40.308Z" }], 1), true);
+check("isStale empty messages never stale", isStale([], 200), false);
+
+// Real-timeline simulations (the reviewer's "compares against itself" claim):
+// stamp = turn-end time (after the final assistant response). The turn's own
+// user message is BEFORE the stamp; the NEXT user message is AFTER it.
+// Same-request continuation (no new user msg): deliver. New user msg: drop.
+const turnTimeline = [
+  { role: "user", timestamp: 100 }, // U_N starts the reviewed turn
+  { role: "assistant", timestamp: 150 }, // agent works
+  { role: "toolResult", timestamp: 150 }, // tool results (shared ms)
+];
+check("same-turn continuation delivers (no newer user msg)", isStale(turnTimeline, 200), false);
+const nextTurnTimeline = [
+  ...turnTimeline,
+  { role: "user", timestamp: 300 }, // U_{N+1} after the reviewed turn ended
+];
+check("next turn drops (newer user msg after turn end)", isStale(nextTurnTimeline, 200), true);
+check("stamp is turn-end, not the turn's own user msg time", isStale(turnTimeline, 100), false);
 
 console.log(failed === 0 ? "\nALL PASS" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);
