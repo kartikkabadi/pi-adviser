@@ -7,7 +7,8 @@
  * its own rolling digest (what it flagged before) plus the new tool output.
  *
  * Usage:
- *   - Installed: on at the start of every session. /adviser on|off - bare /adviser toggles.
+ *   - Installed: on by default. /adviser on|off - bare /adviser toggles. The state is
+ *     saved to the agent config (adviser.json) and restored on every session start.
  *   - Config: PI_ADVISER_MODEL="provider/id" to pick a different model
  *     (default: the main agent's current model).
  *   - Debug: PI_ADVISER_DEBUG=1 logs pass outcomes to stderr.
@@ -19,11 +20,14 @@
  *     delivery is dropped once a newer user message has arrived.
  *   - Silence is the default: the adviser speaks only when something matters.
  */
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
-  TurnEndEvent,
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  getAgentDir,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 
@@ -33,6 +37,9 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 
 const MODEL_OVERRIDE = process.env.PI_ADVISER_MODEL?.trim() ?? "";
 const DEBUG = process.env.PI_ADVISER_DEBUG === "1";
+// Persisted on/off state. Override the path for testing.
+const CONFIG_PATH = process.env.PI_ADVISER_CONFIG || join(getAgentDir(), "adviser.json");
+const DEFAULT_ENABLED = true;
 
 const TOOL_RESULT_MAX_CHARS = 2000; // per tool result
 const PASS_INPUT_MAX_CHARS = 9000; // total tool activity per pass
@@ -57,7 +64,7 @@ Reply with exactly one JSON object and no other text:
 // State.
 // ---------------------------------------------------------------------------
 
-let enabled = true;
+let enabled = readConfig(CONFIG_PATH);
 let digest = ""; // adviser memory: what it flagged, what is open
 let pendingConcerns: string | null = null; // advice waiting for the next LLM call
 let pendingStamp = 0; // turn-end time of the turn the pending pass reviewed
@@ -165,6 +172,25 @@ export function applyCommand(state: boolean, arg: string): boolean {
   return !state; // bare /adviser toggles
 }
 
+/** Read the persisted on/off state. Missing or broken config -> default on. Exported for tests. */
+export function readConfig(path: string): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { enabled?: unknown };
+    return typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_ENABLED;
+  } catch {
+    return DEFAULT_ENABLED;
+  }
+}
+
+/** Persist the on/off state so new sessions restore it. Exported for tests. */
+export function writeConfig(path: string, enabled: boolean): void {
+  try {
+    writeFileSync(path, JSON.stringify({ enabled }, null, 2) + "\n");
+  } catch (error) {
+    log("error writing config:", error);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Extension logic.
 // ---------------------------------------------------------------------------
@@ -256,13 +282,13 @@ async function runPass(ctx: ExtensionContext, input: string, stamp: number): Pro
 export default function (pi: ExtensionAPI): void {
   // New session (or reload): the adviser memory is per-conversation.
   pi.on("session_start", () => {
-    enabled = true; // always on at the start of a session; off never persists across sessions
+    enabled = readConfig(CONFIG_PATH); // restore the saved state; it persists across sessions
     digest = "";
     pendingConcerns = null;
     pendingStamp = 0;
     passing = false;
     shutdown = false;
-    syncAdviserCommand(); // reflect the (always-on) state in the command list
+    syncAdviserCommand(); // reflect the restored state in the command list
   });
 
   // Session ending: stop touching ctx; the adviser never delays or blocks exit.
@@ -313,6 +339,7 @@ export default function (pi: ExtensionAPI): void {
       pendingStamp = 0;
     }
     enabled = on;
+    writeConfig(CONFIG_PATH, enabled); // persist so new sessions keep the state
     if (enabled) {
       setWidget(ctx, ["adviser: on"]);
       ctx.ui.notify("Adviser on", "info");

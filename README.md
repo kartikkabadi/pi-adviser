@@ -14,7 +14,7 @@ Then restart pi or run `/reload`. To try it without installing: `pi -e git:githu
 
 ## Usage
 
-On at the start of every session. The switch:
+On by default. The switch:
 
 ```
 /adviser on
@@ -22,17 +22,18 @@ On at the start of every session. The switch:
 /adviser      # toggles, then shows whether it is on or off
 ```
 
-Turning it off lasts only for the current session; a new session starts with it on again. A widget above the editor shows adviser state: reviewing, nothing to flag, or flagged with the note.
+The state is saved to the agent config (`~/.pi/agent/adviser.json`) and restored when a new session starts: turn it off and every new session stays off until you turn it back on. A widget above the editor shows adviser state: reviewing, nothing to flag, or flagged with the note.
 
 ## Config
 
-One environment variable:
+Environment variables:
 
 ```
 PI_ADVISER_MODEL="provider/id"
+PI_ADVISER_CONFIG="/path/to/adviser.json"
 ```
 
-Default: the main agent's current model. Debug: `PI_ADVISER_DEBUG=1` logs pass outcomes to stderr.
+`PI_ADVISER_MODEL` picks a different model (default: the main agent's current model). `PI_ADVISER_CONFIG` overrides the state file path (default: `~/.pi/agent/adviser.json`). Debug: `PI_ADVISER_DEBUG=1` logs pass outcomes to stderr.
 
 ## How it works
 

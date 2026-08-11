@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 // Unit checks for adviser.ts pure helpers. Run: bun test.ts (from the repo root)
 import {
   applyCommand,
@@ -6,8 +9,10 @@ import {
   isStale,
   newestUserTimestamp,
   parseAdviserOutput,
+  readConfig,
   toolResultText,
   truncate,
+  writeConfig,
 } from "./adviser.ts";
 
 let failed = 0;
@@ -192,6 +197,23 @@ check("bare toggles on->off", applyCommand(true, ""), false);
 check("bare toggles off->on", applyCommand(false, ""), true);
 check("case and spaces ignored", applyCommand(false, "  ON "), true);
 check("unknown args toggle", applyCommand(false, "status"), true);
+
+// readConfig / writeConfig - the persisted on/off state
+const cfgDir = mkdtempSync(join(tmpdir(), "adviser-test-"));
+try {
+  const cfgPath = join(cfgDir, "adviser.json");
+  check("missing config defaults on", readConfig(join(cfgDir, "nope.json")), true);
+  writeConfig(cfgPath, false);
+  check("written off reads back", readConfig(cfgPath), false);
+  writeConfig(cfgPath, true);
+  check("written on reads back", readConfig(cfgPath), true);
+  writeFileSync(cfgPath, "{broken");
+  check("corrupt config defaults on", readConfig(cfgPath), true);
+  writeFileSync(cfgPath, '{"enabled":"yes"}');
+  check("non-boolean config defaults on", readConfig(cfgPath), true);
+} finally {
+  rmSync(cfgDir, { recursive: true, force: true });
+}
 
 // Surrogate pair safety: truncating an emoji must not split the pair.
 // (Kept above the summary/exit so these checks actually run.)
