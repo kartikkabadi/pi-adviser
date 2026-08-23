@@ -211,8 +211,13 @@ export function parseRosterYaml(text: string): { sharedInstructions: string; adv
       if (/^instructions:\s*\|?[>-]?$/.test(trimmed)) {
         const parts: string[] = [];
         let k = i + 1;
-        while (k < lines.length && indentOf(lines[k]) > 0) {
-          if (lines[k].trim() !== "") parts.push(lines[k]);
+        while (k < lines.length) {
+          if (lines[k].trim() === "") {
+            k++;
+            continue;
+          }
+          if (indentOf(lines[k]) === 0) break; // next top-level key ends the block
+          parts.push(lines[k]);
           k++;
         }
         sharedInstructions = dedentBlock(parts);
@@ -224,11 +229,11 @@ export function parseRosterYaml(text: string): { sharedInstructions: string; adv
         while (i < lines.length) {
           const itemLine = lines[i];
           const itemIndent = indentOf(itemLine);
-          if (itemIndent === 0) break; // next top-level key ends the list
           if (itemLine.trim() === "") {
             i++;
             continue;
           }
+          if (itemIndent === 0) break; // next top-level key ends the list
           if (!itemLine.trimStart().startsWith("- ")) {
             i++;
             continue;

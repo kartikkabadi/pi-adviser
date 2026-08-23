@@ -413,6 +413,62 @@ check(
 );
 check("parse: inline instructions", parsed.advisors[1].instructions, "short");
 
+// Regression: the canonical file separates advisors with blank lines and
+// domain comments, and separates shared-instruction paragraphs with blank
+// lines at column 0. The parser must skip those blank lines instead of
+// treating them as block terminators, or the list and shared block get
+// truncated. The old parser stopped the advisors loop at the first indent-0
+// blank line (which stripped domain comments leave behind) and stopped the
+// shared scan at the first blank block line.
+const BLANK_LINE_YAML = [
+  "x-tool-tiers:",
+  "  common: &common",
+  "    - read",
+  "instructions: |",
+  "  Shared contract part one.",
+  "",
+  "  Notify the main agent about every action and observation.",
+  "",
+  "  High-impact limits: give information and escalation only.",
+  "advisors:",
+  "  # domain: software/technical", // stripped comment leaves an indent-0 blank line
+  "  - name: AlphaAdvisor",
+  "    enabled: true",
+  "    model: particle/deepseek-v4-flash-0731:max",
+  "    tools: *common",
+  "    instructions: alpha",
+  "",
+  "  - name: BetaAdvisor",
+  "    enabled: true",
+  "    model: particle/deepseek-v4-flash-0731:max",
+  "    tools: *common",
+  "    instructions: beta",
+  "",
+  "  - name: GammaAdvisor",
+  "    enabled: true",
+  "    model: particle/deepseek-v4-flash-0731:max",
+  "    tools: *common",
+  "    instructions: gamma",
+  "",
+].join("\n");
+const blankParsed = parseRosterYaml(BLANK_LINE_YAML);
+check("blank-line regression: all three advisors parsed", blankParsed.advisors.length, 3);
+check(
+  "blank-line regression: no advisor lost to blank/comment lines",
+  blankParsed.advisors.map((a) => a.name).join(","),
+  "AlphaAdvisor,BetaAdvisor,GammaAdvisor",
+);
+check(
+  "blank-line regression: shared block continues past first blank paragraph",
+  blankParsed.sharedInstructions.includes("Notify the main agent about every action and observation"),
+  true,
+);
+check(
+  "blank-line regression: shared block continues past second blank paragraph",
+  blankParsed.sharedInstructions.includes("High-impact limits: give information and escalation only"),
+  true,
+);
+
 // Validator flags each contract violation.
 const badRoster = {
   sourcePath: "sample",
