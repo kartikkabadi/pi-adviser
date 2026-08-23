@@ -1,13 +1,16 @@
 /**
  * adviser - the canonical 100-advisor roster as a pi extension.
  *
- * On each tool-bearing turn, all roster advisors review the tool activity in
- * parallel (small pool), each with its own rolling digest. Their notes are
- * coalesced into one injected context message on the next LLM call.
+ * On each content-bearing turn - tool activity, a user instruction, or a main
+ * agent reply - the roster advisors review the turn's evidence in parallel
+ * (small pool), each with its own rolling digest. Their notes are coalesced
+ * into one injected context message on the next LLM call.
  *
- * Advisors hold zero tools: they review only the pass input and report
- * through their note. They never mutate anything; fixes are the main
- * agent's job.
+ * Advisors hold zero tools: they review only the evidence in the pass input
+ * and report through their note. They never call tools and never mutate
+ * anything; every action they want taken is named in `requestedAction` for the
+ * main agent to execute, and it is surfaced in the injected note. OMP remains
+ * the full-tool execution host.
  *
  * Usage:
  *   - Installed: on by default. /adviser on|off - bare /adviser toggles. The
@@ -20,9 +23,11 @@
  *
  * Design rules:
  *   - Never blocks or interrupts the main agent.
- *   - One coalesced wave per turn, only when the turn had tool results.
+ *   - One coalesced wave per turn, for every content-bearing turn (tool-less
+ *     user turns included); a turn is never re-reviewed.
  *   - No stale injections: each wave is stamped with its turn's end time;
  *     delivery is dropped once a newer user message has arrived.
+ *   - No repeats: an advisor's unchanged note is suppressed.
  *   - Silence is the default: an advisor speaks only when something matters.
  */
 import { readFileSync, writeFileSync } from "node:fs";
@@ -32,9 +37,11 @@ import {
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
+  type InputEvent,
   type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import type { ThinkingLevel, UserMessage } from "@earendil-works/pi-ai";
 import {
   loadRoster,
   resolveRosterPath,
@@ -54,25 +61,31 @@ const CONFIG_PATH = process.env.PI_ADVISER_CONFIG || join(getAgentDir(), "advise
 const DEFAULT_ENABLED = true;
 
 const TOOL_RESULT_MAX_CHARS = 2000; // per tool result
-const PASS_INPUT_MAX_CHARS = 9000; // total tool activity per pass
-const CONCERNS_MAX_CHARS = 900; // per-note cap
+const USER_TEXT_MAX_CHARS = 2000; // latest user instruction shown to advisors
+const ASSISTANT_TEXT_MAX_CHARS = 2000; // latest main-agent reply shown to advisors
+const PASS_INPUT_MAX_CHARS = 9000; // total pass input budget
+const NOTE_MAX_CHARS = 900; // per-note cap
+const ACTION_MAX_CHARS = 400; // per requested-action cap
 const DIGEST_MAX_CHARS = 700; // per-advisor memory, hard cap
 const NOTES_MAX_CHARS = 3000; // combined injected notes, hard cap
 const PASS_CONCURRENCY = 8; // advisors in flight at once
 
-const SYSTEM_PROMPT = `You are Adviser, a second-opinion reviewer inside a coding agent session. You watch what the main agent reads and runs, and you flag real problems with sharp questions.
+const SYSTEM_PROMPT = `You are an adviser in the Adviser extension inside a Pi agent session. You watch the working session - the user's requests, the main agent's replies, and the tool activity it reports - and you proactively advise across work, life, and world decisions. You never run tools and you never act: you observe only the evidence shown to you and you report, so the main agent can act.
 
 Input format:
 - DIGEST: your memory of previous findings and their status.
-- NEW TOOL ACTIVITY: tool calls and outputs since your last review.
+- USER INSTRUCTION: the user's latest request (shown when a turn without tool activity is reviewed).
+- MAIN AGENT REPLY: the main agent's latest response (shown when a turn without tool activity is reviewed).
+- NEW TOOL ACTIVITY: tool calls and outputs the main agent reported since your last review.
 
 Rules:
-- Flag only what matters: concrete mistakes, missing verification, risky or destructive commands, contradictions with your digest, wasted work.
-- Do not comment on code style, trivialities, or anything your digest shows as resolved.
-- You can only review what is shown. You cannot read files or run tools.
+- Evaluate every relevant turn proactively, including turns with no tool activity. Do not wait to be summoned; silence is the spam control.
+- Flag only what matters and is grounded in the evidence shown. Name one concrete thing per note: an action, a discovery, a change, an opportunity, or a risk.
+- Name the action you want the main agent to take in requestedAction. You cannot take it yourself.
+- You can only review what is shown. You cannot read files, browse, or run tools.
 
 Reply with exactly one JSON object and no other text:
-{"concerns": "message to the main agent: sharp questions and checks it must answer. Empty string when nothing is worth saying. Max 150 words.", "digest": "your updated memory: findings, resolved status, open concerns. Max 100 words."}`;
+{"note": "one concrete observation for the main agent: an action taken, a discovery, a change, an opportunity, or an emerging risk, anchored to the evidence that produced it. Empty string when nothing is worth saying. Max 150 words.", "requestedAction": "the exact action the main agent should take; empty string when none. Max 50 words.", "digest": "your updated memory: findings, resolved status, open concerns. Max 100 words."}`;
 
 // ---------------------------------------------------------------------------
 // State.
@@ -86,6 +99,9 @@ let pendingNotes: { advisor: string; text: string }[] | null = null; // waiting 
 let pendingStamp = 0; // turn-end time of the turn the pending wave reviewed
 let passing = false; // coalescing: skip turns while a wave is in flight
 let shutdown = false; // session is being torn down; stop touching ctx
+let lastUserInput = ""; // latest user instruction (from the input event)
+let lastUserInputTime = 0; // when that instruction arrived
+let lastReviewedInputTime = 0; // input time of the last reviewed turn (no-repeat)
 
 // ---------------------------------------------------------------------------
 // Pure helpers - exported for tests.
@@ -125,26 +141,98 @@ export function toolResultText(content: { type: string; text?: string }[]): stri
     .join("");
 }
 
-/** Build an advisor's pass input: its digest + new tool activity. */
-export function buildPassInput(
-  digest: string,
-  entries: { toolName: string; text: string }[],
-): string {
+/** Extract the visible text from an assistant message's content parts. Exported for tests. */
+export function assistantMessageText(message: {
+  content?: Array<{ type?: string; text?: string }>;
+}): string {
+  return (message.content ?? [])
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text as string)
+    .join("")
+    .trim();
+}
+
+/** Reduce the turn's tool results to non-empty text entries. Exported for tests. */
+export function toolResultsToEntries(
+  toolResults: { toolName: string; content?: { type: string; text?: string }[] }[],
+): { toolName: string; text: string }[] {
+  const entries: { toolName: string; text: string }[] = [];
+  for (const result of toolResults) {
+    const text = toolResultText((result.content ?? []) as { type: string; text?: string }[]);
+    if (text.trim()) entries.push({ toolName: result.toolName, text });
+  }
+  return entries;
+}
+
+/** Everything advisors may see about one turn. */
+export interface TurnEvidence {
+  /** Latest user instruction (trimmed, capped). */
+  userText: string;
+  /** Latest main-agent reply (trimmed, capped). */
+  assistantText: string;
+  /** Non-empty tool results from the turn. */
+  toolEntries: { toolName: string; text: string }[];
+}
+
+/**
+ * Compose the evidence for one turn: the user instruction captured from the
+ * input event, the main agent's reply, and the turn's tool results. Each text
+ * source is capped so the combined pass stays bounded. Exported for tests.
+ */
+export function buildTurnEvidence(
+  assistantMessage: { content?: Array<{ type?: string; text?: string }> },
+  toolResults: { toolName: string; content?: { type: string; text?: string }[] }[],
+  userText: string,
+): TurnEvidence {
+  return {
+    userText: truncate(userText.trim(), USER_TEXT_MAX_CHARS),
+    assistantText: truncate(assistantMessageText(assistantMessage), ASSISTANT_TEXT_MAX_CHARS),
+    toolEntries: toolResultsToEntries(toolResults),
+  };
+}
+
+/**
+ * A turn is worth reviewing when it carries any evidence: user text, an
+ * assistant reply, or tool activity. Tool-less user turns are included so
+ * advisors proactively cover the whole working session. Exported for tests.
+ */
+export function shouldReviewTurn(evidence: TurnEvidence): boolean {
+  return (
+    evidence.userText.length > 0 ||
+    evidence.assistantText.length > 0 ||
+    evidence.toolEntries.length > 0
+  );
+}
+
+/** Build an advisor's pass input: its digest + the turn's evidence. */
+export function buildPassInput(digest: string, evidence: TurnEvidence): string {
+  const parts: string[] = [];
+  if (evidence.userText) {
+    parts.push(`USER INSTRUCTION:\n${truncate(evidence.userText, USER_TEXT_MAX_CHARS)}`);
+  }
+  if (evidence.assistantText) {
+    parts.push(`MAIN AGENT REPLY:\n${truncate(evidence.assistantText, ASSISTANT_TEXT_MAX_CHARS)}`);
+  }
   let body = "";
-  for (const entry of entries) {
+  for (const entry of evidence.toolEntries) {
     const block = `## ${entry.toolName}\n${truncate(entry.text, TOOL_RESULT_MAX_CHARS)}\n`;
     if (body.length + block.length > PASS_INPUT_MAX_CHARS) break;
     body += block;
   }
-  return `DIGEST:\n${digest || "(none)"}\n\nNEW TOOL ACTIVITY:\n${body}`;
+  if (body) parts.push(`NEW TOOL ACTIVITY:\n${body}`);
+  return `DIGEST:\n${digest || "(none)"}\n\n${parts.join("\n\n")}`;
 }
 
 /**
- * Parse an advisor's reply. Expects one JSON object {concerns, digest}.
- * Falls back to treating the whole reply as concerns when JSON is not
- * recoverable. Returns digest "" when the reply did not provide one.
+ * Parse an advisor's reply. Expects one JSON object {note, requestedAction,
+ * digest}. Falls back to treating the whole reply as the note when JSON is
+ * not recoverable. Returns digest "" when the reply did not provide one.
  */
-export function parseAdviserOutput(text: string): { concerns: string; digest: string } {
+export function parseAdviserOutput(text: string): {
+  note: string;
+  requestedAction: string;
+  digest: string;
+} {
   const cleaned = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
@@ -152,16 +240,18 @@ export function parseAdviserOutput(text: string): { concerns: string; digest: st
     try {
       const obj = JSON.parse(cleaned.slice(start, end + 1));
       return {
-        concerns:
-          typeof obj.concerns === "string" ? obj.concerns.trim().slice(0, CONCERNS_MAX_CHARS) : "",
-        digest:
-          typeof obj.digest === "string" ? obj.digest.trim().slice(0, DIGEST_MAX_CHARS) : "",
+        note: typeof obj.note === "string" ? obj.note.trim().slice(0, NOTE_MAX_CHARS) : "",
+        requestedAction:
+          typeof obj.requestedAction === "string"
+            ? obj.requestedAction.trim().slice(0, ACTION_MAX_CHARS)
+            : "",
+        digest: typeof obj.digest === "string" ? obj.digest.trim().slice(0, DIGEST_MAX_CHARS) : "",
       };
     } catch {
       // fall through to the fallback below
     }
   }
-  return { concerns: truncate(cleaned, CONCERNS_MAX_CHARS), digest: "" };
+  return { note: truncate(cleaned, NOTE_MAX_CHARS), requestedAction: "", digest: "" };
 }
 
 /** Newest user-message timestamp in a message list; 0 when none. Exported for tests. */
@@ -186,13 +276,13 @@ export function isStale(messages: { role?: string; timestamp?: number | string }
 }
 
 /** Build the injected context message. Exported for tests. */
-export function buildInjection(concerns: string): Record<string, unknown> {
+export function buildInjection(concerns: string): UserMessage {
   return {
     role: "user",
     content: [
       {
         type: "text",
-        text: `[adviser] Note from a review of earlier tool activity (not the user's current instruction): ${concerns}`,
+        text: `[adviser] Proactive notes from roster advisors on the previous turn (background, not the user's current instruction): ${concerns}`,
       },
     ],
     timestamp: Date.now(),
@@ -207,31 +297,42 @@ export function applyCommand(state: boolean, arg: string): boolean {
   return !state; // bare /adviser toggles
 }
 
-/** Combine per-advisor notes into one injected text, hard-capped. Exported for tests. */
+/**
+ * Combine per-advisor notes into one injected text, hard-capped. Actions
+ * requested by advisors render first so the main agent sees them; every
+ * requested action is surfaced, never silently executed. Exported for tests.
+ */
 export function combineNotes(
-  notes: { advisor: string; text: string }[],
+  notes: { advisor: string; text: string; action?: string }[],
   max = NOTES_MAX_CHARS,
 ): string {
-  const lines: string[] = [];
-  let used = 0;
-  for (const note of notes) {
-    const line = `- [${note.advisor}] ${note.text}`;
-    if (used + line.length > max) break;
-    lines.push(line);
-    used += line.length + 1;
+  const sections: string[] = [];
+  const actions = notes.filter((n) => n.action);
+  if (actions.length) {
+    sections.push("ACTIONS REQUESTED:\n" + actions.map((n) => `- [${n.advisor}] ${n.action}`).join("\n"));
   }
-  return lines.join("\n");
+  const texts = notes.filter((n) => n.text);
+  if (texts.length) {
+    sections.push("NOTES:\n" + texts.map((n) => `- [${n.advisor}] ${n.text}`).join("\n"));
+  }
+  let out = sections.join("\n\n");
+  if (out.length > max) out = out.slice(0, max);
+  return out;
 }
 
 /**
- * Deterministic no-repeat: an advisor's concern is suppressed when it is
- * unchanged from the last one delivered. Returns the concern to deliver,
- * or null when it is an unchanged repeat. Exported for tests.
+ * Deterministic no-repeat: a note (keyed by note text plus requested action)
+ * is suppressed when it is unchanged from the last one delivered. Returns
+ * true when the note is new and should be delivered. Exported for tests.
  */
-export function dedupeConcern(advisor: string, concerns: string, last: Map<string, string>): string | null {
-  if (last.get(advisor) === concerns) return null;
-  last.set(advisor, concerns);
-  return concerns;
+export function dedupeConcern(
+  advisor: string,
+  key: string,
+  last: Map<string, string>,
+): boolean {
+  if (last.get(advisor) === key) return false;
+  last.set(advisor, key);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +390,7 @@ export function effectiveModelPin(spec: string, override: string): string | null
  * Resolve a roster model pin like "particle/deepseek-v4-flash-0731:max".
  * The ":max" suffix is the thinking level, passed as options.reasoning.
  */
-function resolveRosterModel(ctx: ExtensionContext, spec: string): { model: unknown; reasoning: string } | null {
+function resolveRosterModel(ctx: ExtensionContext, spec: string): { model: unknown; reasoning: ThinkingLevel } | null {
   const target = effectiveModelPin(spec, MODEL_OVERRIDE);
   if (!target) {
     log("error: malformed roster model pin:", spec);
@@ -298,22 +399,28 @@ function resolveRosterModel(ctx: ExtensionContext, spec: string): { model: unkno
   const pin = parseModelPin(target);
   if (!pin) return null;
   const model = ctx.modelRegistry.find(pin.provider, pin.modelId);
-  return model ? { model, reasoning: pin.reasoning } : null;
+  return model ? { model, reasoning: pin.reasoning as ThinkingLevel } : null;
 }
 
-/** An advisor's system prompt: shared roster contract + its own role. */
-function buildAdvisorSystemPrompt(shared: string, advisor: AdvisorSpec): string {
-  return `${shared}
+/**
+ * An advisor's system prompt: the shared proactive contract + its own role,
+ * with the extension-wide meta-prompt, the no-tools rule, and the report
+ * contract. Exported for tests.
+ */
+export function buildAdvisorSystemPrompt(shared: string, advisor: AdvisorSpec): string {
+  return `${SYSTEM_PROMPT}
+
+${shared}
 
 Your role: ${advisor.name}.
 
 Role instructions:
 ${advisor.instructions}
 
-Tools granted to you: none. You are read-only - you review only the tool activity shown in the pass input and report through your note. You never mutate anything; you only report observations for the main agent to act on.
+Tools granted to you: none. You are read-only - you review only the evidence shown in the pass input and report through your note and requestedAction. You never call tools and you never mutate anything; every action you want taken is named in requestedAction for the main agent to execute.
 
 Reply with exactly one JSON object and no other text:
-{"concerns": "message to the main agent: one concrete issue, next action, drift, evidence gap, or milestone resolution, patch-anchored to the evidence that produced it. Empty string when nothing is worth saying. Max 150 words.", "digest": "your updated memory: findings, resolved status, open concerns. Max 100 words."}`;
+{"note": "one concrete observation for the main agent: an action taken, a discovery, a change, an opportunity, or an emerging risk, anchored to the evidence that produced it. Empty string when nothing is worth saying. Max 150 words.", "requestedAction": "the exact action the main agent should take; empty string when none. Max 50 words.", "digest": "your updated memory: findings, resolved status, open concerns. Max 100 words."}`;
 }
 
 function setWidget(ctx: ExtensionContext, lines: string[]): void {
@@ -325,13 +432,13 @@ function setWidget(ctx: ExtensionContext, lines: string[]): void {
   }
 }
 
-/** One advisor reviewing the turn: its digest + the tool activity -> note or silence. */
+/** One advisor reviewing the turn: its digest + the turn's evidence -> note or silence. */
 async function runAdvisorPass(
   ctx: ExtensionContext,
   advisor: AdvisorSpec,
   sharedInstructions: string,
-  entries: { toolName: string; text: string }[],
-): Promise<{ advisor: string; text: string } | null> {
+  evidence: TurnEvidence,
+): Promise<{ advisor: string; text: string; action?: string } | null> {
   try {
     const resolved = resolveRosterModel(ctx, advisor.model);
     if (!resolved) {
@@ -339,12 +446,12 @@ async function runAdvisorPass(
       return null;
     }
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(resolved.model as never);
-    if (!auth.apiKey) {
+    if (!auth.ok) {
       log("error: no api key for", advisor.name);
       return null;
     }
     const prevDigest = digests.get(advisor.name) ?? "";
-    const input = buildPassInput(prevDigest, entries);
+    const input = buildPassInput(prevDigest, evidence);
     const reply = await completeSimple(
       resolved.model as never,
       {
@@ -371,9 +478,10 @@ async function runAdvisorPass(
       .join("");
     const result = parseAdviserOutput(replyText);
     if (result.digest) digests.set(advisor.name, result.digest);
-    if (!result.concerns) return null;
-    const text = dedupeConcern(advisor.name, result.concerns, lastConcerns);
-    return text ? { advisor: advisor.name, text } : null;
+    const key = result.note + "\u0000" + result.requestedAction;
+    if (!dedupeConcern(advisor.name, key, lastConcerns)) return null;
+    if (!result.note && !result.requestedAction) return null;
+    return { advisor: advisor.name, text: result.note, action: result.requestedAction || undefined };
   } catch (error) {
     log("advisor error:", advisor.name, error);
     return null;
@@ -383,7 +491,7 @@ async function runAdvisorPass(
 /** Review the turn with all roster advisors, pooled, then queue their notes. */
 async function runRosterPass(
   ctx: ExtensionContext,
-  entries: { toolName: string; text: string }[],
+  evidence: TurnEvidence,
   stamp: number,
 ): Promise<void> {
   const list = roster?.advisors ?? [];
@@ -392,13 +500,13 @@ async function runRosterPass(
     setWidget(ctx, ["adviser: error: roster has no advisors"]);
     return;
   }
-  setWidget(ctx, [`adviser: ${list.length} advisors reviewing the last tool activity...`]);
-  const notes: { advisor: string; text: string }[] = [];
+  setWidget(ctx, [`adviser: ${list.length} advisors reviewing the last turn...`]);
+  const notes: { advisor: string; text: string; action?: string }[] = [];
   let cursor = 0;
   const worker = async (): Promise<void> => {
     while (cursor < list.length) {
       const index = cursor++;
-      const note = await runAdvisorPass(ctx, list[index], shared, entries);
+      const note = await runAdvisorPass(ctx, list[index], shared, evidence);
       if (note) notes.push(note);
     }
   };
@@ -429,6 +537,9 @@ export default function (pi: ExtensionAPI): void {
     pendingStamp = 0;
     passing = false;
     shutdown = false;
+    lastUserInput = "";
+    lastUserInputTime = 0;
+    lastReviewedInputTime = 0;
     roster = loadRoster();
     if (roster) {
       const issues = validateRoster(roster);
@@ -449,22 +560,44 @@ export default function (pi: ExtensionAPI): void {
     shutdown = true;
   });
 
-  // Trigger: one coalesced wave per turn, only when the turn produced tool results.
+  // Input: capture the latest user instruction so advisors can review turns
+  // that had no tool activity. Command dispatches and the adviser's own
+  // injections are skipped so they never surface as user intent.
+  pi.on("input", (event: InputEvent) => {
+    const text = typeof event.text === "string" ? event.text : "";
+    const t = text.trim();
+    if (!t || t.startsWith("/") || t.startsWith("[adviser]")) return;
+    lastUserInput = t;
+    lastUserInputTime = Date.now();
+  });
+
+  // Trigger: one coalesced wave per content-bearing turn. Tool-less turns
+  // (a user instruction, a main agent reply) are reviewed too, and a turn is
+  // never re-reviewed: the input guard and the no-repeat stamp both hold.
   pi.on("turn_end", (event: TurnEndEvent, ctx: ExtensionContext) => {
     if (!enabled || passing) return;
     if (!roster) {
       setWidget(ctx, ["adviser: error: no roster - set PI_ADVISER_ROSTER"]);
       return;
     }
-    const entries: { toolName: string; text: string }[] = [];
-    for (const result of event.toolResults) {
-      const text = toolResultText(result.content as { type: string; text?: string }[]);
-      if (text.trim()) entries.push({ toolName: result.toolName, text });
+    const evidence = buildTurnEvidence(
+      "content" in event.message && Array.isArray(event.message.content)
+        ? { content: event.message.content }
+        : {},
+      event.toolResults,
+      lastUserInput,
+    );
+    // No-repeat: skip unless this turn has evidence we have not reviewed.
+    // A turn with tool activity is always new; a tool-less turn is reviewed
+    // exactly once per new user input.
+    if (lastUserInputTime <= lastReviewedInputTime && evidence.toolEntries.length === 0) {
+      return;
     }
-    if (entries.length === 0) return;
+    if (!shouldReviewTurn(evidence)) return;
+    lastReviewedInputTime = lastUserInputTime;
     passing = true;
     const stamp = Date.now(); // the turn this wave reviews
-    void runRosterPass(ctx, entries, stamp).finally(() => {
+    void runRosterPass(ctx, evidence, stamp).finally(() => {
       passing = false;
     });
   });

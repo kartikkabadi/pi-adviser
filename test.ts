@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   applyCommand,
+  assistantMessageText,
+  buildAdvisorSystemPrompt,
   buildInjection,
   buildPassInput,
+  buildTurnEvidence,
   combineNotes,
   dedupeConcern,
   effectiveModelPin,
@@ -14,7 +17,9 @@ import {
   parseAdviserOutput,
   parseModelPin,
   readConfig,
+  shouldReviewTurn,
   toolResultText,
+  toolResultsToEntries,
   truncate,
   writeConfig,
 } from "./adviser.ts";
@@ -54,12 +59,72 @@ check(
 );
 check("toolResultText empty", toolResultText([]), "");
 
-// buildPassInput
-const input = buildPassInput("flagged X, open", [
-  { toolName: "read", text: "file content here" },
-  { toolName: "bash", text: "ok".repeat(3000) }, // over per-result cap
-]);
+// assistantMessageText / toolResultsToEntries / buildTurnEvidence / shouldReviewTurn
+check(
+  "assistantMessageText joins text parts only",
+  assistantMessageText({
+    content: [
+      { type: "text", text: "a" },
+      { type: "image", text: "nope" },
+      { type: "text", text: "b" },
+    ],
+  }),
+  "ab",
+);
+check("assistantMessageText empty content", assistantMessageText({}), "");
+check(
+  "toolResultsToEntries drops empty results",
+  toolResultsToEntries([
+    { toolName: "read", content: [{ type: "text", text: "x" }] },
+    { toolName: "bash", content: [{ type: "text", text: "   " }] },
+  ]).map((it) => it.toolName),
+  ["read"],
+);
+check("toolResultsToEntries empty", toolResultsToEntries([]).length, 0);
+const evidence = buildTurnEvidence(
+  { content: [{ type: "text", text: "  deployed v2  " }, { type: "image" }] },
+  [
+    { toolName: "read", content: [{ type: "text", text: "file content here" }] },
+    { toolName: "bash", content: [{ type: "text", text: "  " }] },
+  ],
+  "  check the deploy  ",
+);
+check("buildTurnEvidence trims user text", evidence.userText, "check the deploy");
+check("buildTurnEvidence trims assistant text", evidence.assistantText, "deployed v2");
+check("buildTurnEvidence keeps non-empty tool entries", evidence.toolEntries.length, 1);
+check(
+  "shouldReviewTurn true with user text only",
+  shouldReviewTurn({ userText: "hi", assistantText: "", toolEntries: [] }),
+  true,
+);
+check(
+  "shouldReviewTurn true with assistant text only",
+  shouldReviewTurn({ userText: "", assistantText: "hi", toolEntries: [] }),
+  true,
+);
+check(
+  "shouldReviewTurn true with tool activity only",
+  shouldReviewTurn({ userText: "", assistantText: "", toolEntries: [{ toolName: "read", text: "x" }] }),
+  true,
+);
+check(
+  "shouldReviewTurn false when no evidence",
+  shouldReviewTurn({ userText: "", assistantText: "", toolEntries: [] }),
+  false,
+);
+
+// buildPassInput: evidence-based, tool-less turns included
+const input = buildPassInput("flagged X, open", {
+  userText: "check the deploy",
+  assistantText: "deployed v2",
+  toolEntries: [
+    { toolName: "read", text: "file content here" },
+    { toolName: "bash", text: "ok".repeat(3000) }, // over per-result cap
+  ],
+});
 check("pass input has digest", input.includes("DIGEST:\nflagged X, open"), true);
+check("pass input has user instruction", input.includes("USER INSTRUCTION:\ncheck the deploy"), true);
+check("pass input has assistant reply", input.includes("MAIN AGENT REPLY:\ndeployed v2"), true);
 check("pass input has tool block", input.includes("## read\nfile content here"), true);
 check("pass input truncates per result", input.includes("...[truncated]"), true);
 check(
@@ -67,35 +132,47 @@ check(
   input.length <= 9000 + 700 + 200,
   true,
 );
+const toolLess = buildPassInput("d", {
+  userText: "plan the week",
+  assistantText: "here is the plan",
+  toolEntries: [],
+});
+check("pass input renders tool-less turn", toolLess.includes("USER INSTRUCTION:\nplan the week"), true);
+check("pass input includes reply in tool-less turn", toolLess.includes("MAIN AGENT REPLY:\nhere is the plan"), true);
+check("pass input omits tool section when none", toolLess.includes("NEW TOOL ACTIVITY:"), false);
 
-// parseAdviserOutput
+// parseAdviserOutput: {note, requestedAction, digest}
 check(
   "parses clean json",
-  parseAdviserOutput('{"concerns":"check X","digest":"Y open"}'),
-  { concerns: "check X", digest: "Y open" },
+  parseAdviserOutput('{"note":"check X","requestedAction":"run the test","digest":"Y open"}'),
+  { note: "check X", requestedAction: "run the test", digest: "Y open" },
 );
 check(
   "parses json inside fences",
-  parseAdviserOutput('```json\n{"concerns":"c","digest":"d"}\n```'),
-  { concerns: "c", digest: "d" },
+  parseAdviserOutput('```json\n{"note":"c","requestedAction":"a","digest":"d"}\n```'),
+  { note: "c", requestedAction: "a", digest: "d" },
 );
 check(
   "parses json with leading prose",
-  parseAdviserOutput('Here you go:\n{"concerns":"c2","digest":"d2"}'),
-  { concerns: "c2", digest: "d2" },
+  parseAdviserOutput('Here you go:\n{"note":"c2","requestedAction":"a2","digest":"d2"}'),
+  { note: "c2", requestedAction: "a2", digest: "d2" },
 );
 check(
-  "empty concerns stays empty",
-  parseAdviserOutput('{"concerns":"","digest":"d"}'),
-  { concerns: "", digest: "d" },
+  "empty note stays empty",
+  parseAdviserOutput('{"note":"","requestedAction":"a","digest":"d"}'),
+  { note: "", requestedAction: "a", digest: "d" },
 );
 check(
-  "unparseable text becomes concerns",
+  "unparseable text becomes note",
   parseAdviserOutput("You forgot to verify the build."),
-  { concerns: "You forgot to verify the build.", digest: "" },
+  { note: "You forgot to verify the build.", requestedAction: "", digest: "" },
 );
-const longConcerns = parseAdviserOutput('{"concerns":"' + "x".repeat(2000) + '","digest":"d"}');
-check("concerns capped at 900 chars", longConcerns.concerns.length <= 900, true);
+const longReply = parseAdviserOutput(
+  '{"note":"' + "x".repeat(2000) + '","requestedAction":"' + "y".repeat(2000) + '","digest":"d"}',
+);
+check("note capped at 900 chars", longReply.note.length <= 900, true);
+check("requestedAction capped at 400 chars", longReply.requestedAction.length <= 400, true);
+check("digest capped at 700 chars", parseAdviserOutput('{"digest":"' + "z".repeat(2000) + '"}').digest.length <= 700, true);
 
 // buildInjection
 const inj = buildInjection("check Y") as { role: string; content: { type: string; text: string }[] };
@@ -103,9 +180,9 @@ check("injection is user role", inj.role, "user");
 check(
   "injection prefixes adviser and marks earlier review",
   inj.content[0].text,
-  "[adviser] Note from a review of earlier tool activity (not the user's current instruction): check Y",
+  "[adviser] Proactive notes from roster advisors on the previous turn (background, not the user's current instruction): check Y",
 );
-check("injection text contains the concerns", inj.content[0].text.includes("check Y"), true);
+check("injection text contains the note", inj.content[0].text.includes("check Y"), true);
 
 // buildInjection - adversarial content: quotes, slashes, newlines, fake prompt injection.
 // The message is a STRUCTURED text part (role user, one content part), so there is no
@@ -120,7 +197,7 @@ check("adversarial injection: part type is text", inj2.content[0].type, "text");
 check(
   "adversarial injection: text preserved exactly (no mangling)",
   inj2.content[0].text,
-  "[adviser] Note from a review of earlier tool activity (not the user's current instruction): " + nasty,
+  "[adviser] Proactive notes from roster advisors on the previous turn (background, not the user's current instruction): " + nasty,
 );
 const roundTrip = JSON.parse(JSON.stringify(inj2));
 check(
@@ -226,21 +303,36 @@ try {
   rmSync(cfgDir, { recursive: true, force: true });
 }
 
-// combineNotes
-check("combineNotes joins with advisor tags", combineNotes([{ advisor: "Alpha", text: "hi" }]), "- [Alpha] hi");
+// combineNotes: requested actions render first, then notes.
 check(
-  "combineNotes caps overflow",
-  combineNotes([{ advisor: "A", text: "x".repeat(20) }, { advisor: "B", text: "y".repeat(20) }], 30),
-  "- [A] " + "x".repeat(20),
+  "combineNotes renders actions before notes",
+  combineNotes([
+    { advisor: "Alpha", text: "note", action: "act" },
+    { advisor: "Beta", text: "note2" },
+  ]),
+  "ACTIONS REQUESTED:\n- [Alpha] act\n\nNOTES:\n- [Alpha] note\n- [Beta] note2",
 );
+check(
+  "combineNotes no actions section when none",
+  combineNotes([{ advisor: "Alpha", text: "hi" }]),
+  "NOTES:\n- [Alpha] hi",
+);
+check("combineNotes empty", combineNotes([]), "");
+const cappedNotes = combineNotes(
+  [{ advisor: "A", text: "x".repeat(20), action: "y".repeat(20) }],
+  30,
+);
+check("combineNotes caps total", cappedNotes.length <= 30, true);
+check("combineNotes keeps actions on cap", cappedNotes.startsWith("ACTIONS REQUESTED:"), true);
 
-// dedupeConcern: unchanged advice is suppressed deterministically.
-const lastConcerns = new Map<string, string>();
-check("no-repeat: first concern delivered", dedupeConcern("A", "check X", lastConcerns), "check X");
-check("no-repeat: unchanged concern suppressed", dedupeConcern("A", "check X", lastConcerns), null);
-check("no-repeat: changed concern delivered", dedupeConcern("A", "check Y", lastConcerns), "check Y");
-check("no-repeat: repeat after change suppressed", dedupeConcern("A", "check Y", lastConcerns), null);
-check("no-repeat: independent per advisor", dedupeConcern("B", "check X", lastConcerns), "check X");
+// dedupeConcern: unchanged advice (note + requested action) is suppressed.
+const lastNotes = new Map<string, string>();
+check("no-repeat: first note delivered", dedupeConcern("A", "check X\u0000run", lastNotes), true);
+check("no-repeat: unchanged note suppressed", dedupeConcern("A", "check X\u0000run", lastNotes), false);
+check("no-repeat: changed note delivered", dedupeConcern("A", "check Y\u0000run", lastNotes), true);
+check("no-repeat: repeat after change suppressed", dedupeConcern("A", "check Y\u0000run", lastNotes), false);
+check("no-repeat: action change re-delivers", dedupeConcern("A", "check X\u0000run2", lastNotes), true);
+check("no-repeat: independent per advisor", dedupeConcern("B", "check X\u0000run", lastNotes), true);
 
 // effectiveModelPin: the dev override never weakens the roster pin.
 check("model pin: no override uses pin", effectiveModelPin(ROSTER_MODEL, ""), ROSTER_MODEL);
@@ -251,11 +343,29 @@ check("model pin: lower reasoning ignored", effectiveModelPin(ROSTER_MODEL, "par
 check("model pin: malformed spec rejected", effectiveModelPin("malformed", ""), null);
 check("parse pin: extracts reasoning", parseModelPin(ROSTER_MODEL)?.reasoning, "max");
 
-// Roster parser on a representative sample (anchors, block scalars, comments).
+// buildAdvisorSystemPrompt: proactive, no runtime tools, actions to main agent.
+const rolePrompt = buildAdvisorSystemPrompt("SHARED", {
+  name: "Alpha",
+  enabled: true,
+  model: ROSTER_MODEL,
+  tools: ["read"],
+  instructions: "ROLE",
+});
+check("advisor prompt includes shared contract", rolePrompt.includes("SHARED"), true);
+check("advisor prompt includes role", rolePrompt.includes("ROLE"), true);
+check("advisor prompt forbids runtime tools", rolePrompt.includes("Tools granted to you: none"), true);
+check("advisor prompt routes actions to main agent", rolePrompt.includes("requestedAction"), true);
+check("advisor prompt demands note json", rolePrompt.includes('"note"'), true);
+check("advisor prompt is proactive", rolePrompt.includes("Evaluate every relevant turn"), true);
+
+// Roster parser on a representative sample (inline + block tiers, domain, comments).
 const SAMPLE_YAML = [
   "# comment outside block scalar",
   "x-tool-tiers:",
-  "  &t1 [read, glob, grep]",
+  "  t1: &t1 [read, glob, grep]",
+  "  common: &common",
+  "    - read",
+  "    - write",
   "instructions: |",
   "  Shared contract with a # hash inside.",
   "  Second line.",
@@ -263,6 +373,7 @@ const SAMPLE_YAML = [
   "  - name: AlphaAdvisor",
   "    enabled: true",
   "    model: particle/deepseek-v4-flash-0731:max",
+  "    domain: software/technical",
   "    tools: *t1",
   "    instructions: |",
   "      Alpha role line.",
@@ -270,7 +381,7 @@ const SAMPLE_YAML = [
   "  - name: BetaAdvisor",
   "    enabled: true",
   "    model: particle/deepseek-v4-flash-0731:max",
-  "    tools: *t1",
+  "    tools: *common",
   "    instructions: short",
   "",
 ].join("\n");
@@ -283,7 +394,18 @@ check(
 );
 check("parse: first advisor name", parsed.advisors[0].name, "AlphaAdvisor");
 check("parse: model pin", parsed.advisors[0].model, "particle/deepseek-v4-flash-0731:max");
-check("parse: tools marker", parsed.advisors[0].hasTools, true);
+check(
+  "parse: inline tier resolves to tool names",
+  JSON.stringify(parsed.advisors[0].tools),
+  JSON.stringify(["read", "glob", "grep"]),
+);
+check(
+  "parse: block tier resolves to tool names",
+  JSON.stringify(parsed.advisors[1].tools),
+  JSON.stringify(["read", "write"]),
+);
+check("parse: domain captured", parsed.advisors[0].domain, "software/technical");
+check("parse: domain optional", parsed.advisors[1].domain, undefined);
 check(
   "parse: block instructions keep # inside block",
   parsed.advisors[0].instructions,
@@ -296,9 +418,9 @@ const badRoster = {
   sourcePath: "sample",
   sharedInstructions: "x",
   advisors: [
-    { name: "", enabled: false, model: "other/model:max", hasTools: false, instructions: "" },
-    { name: "dup", enabled: true, model: ROSTER_MODEL, hasTools: true, instructions: "" },
-    { name: "dup", enabled: true, model: ROSTER_MODEL, hasTools: true, instructions: "" },
+    { name: "", enabled: false, model: "other/model:max", tools: [], instructions: "" },
+    { name: "dup", enabled: true, model: ROSTER_MODEL, tools: ["read"], instructions: "" },
+    { name: "dup", enabled: true, model: ROSTER_MODEL, tools: [], instructions: "" },
   ],
 };
 const badIssues = validateRoster(badRoster);
@@ -307,14 +429,14 @@ check("validate: unnamed flagged", badIssues.some((it) => it.message.includes("m
 check("validate: duplicate flagged", badIssues.filter((it) => it.advisor === "dup").length >= 1, true);
 check("validate: not enabled flagged", badIssues.some((it) => it.message === "not enabled"), true);
 check("validate: wrong model flagged", badIssues.some((it) => it.message.includes("!=")), true);
-check("validate: missing tools flagged", badIssues.some((it) => it.message === "tools tier missing"), true);
+check("validate: missing tools flagged", badIssues.some((it) => it.message === "tools missing"), true);
 
 // Fail closed: missing shared or per-advisor instructions are rejections.
 const noSharedRoster = {
   sourcePath: "sample",
   sharedInstructions: "   ",
   advisors: [
-    { name: "A", enabled: true, model: ROSTER_MODEL, hasTools: true, instructions: "x" },
+    { name: "A", enabled: true, model: ROSTER_MODEL, tools: ["read"], instructions: "x" },
   ],
 };
 check(
@@ -327,7 +449,7 @@ const noInstrRoster = {
   sourcePath: "sample",
   sharedInstructions: "x",
   advisors: [
-    { name: "A", enabled: true, model: ROSTER_MODEL, hasTools: true, instructions: "" },
+    { name: "A", enabled: true, model: ROSTER_MODEL, tools: ["read"], instructions: "" },
   ],
 };
 check(
@@ -336,7 +458,145 @@ check(
   true,
 );
 
-// Live canonical roster (this machine): exactly 100 enabled, all pinned.
+// Unknown tier alias must fail closed: the advisor resolves to no tools.
+const brokenTierYaml = [
+  "x-tool-tiers:",
+  "  common: &common",
+  "    - read",
+  "advisors:",
+  "  - name: Bad",
+  "    enabled: true",
+  "    model: " + ROSTER_MODEL,
+  "    tools: *missing",
+  "    instructions: x",
+  "",
+].join("\n");
+const brokenParsed = parseRosterYaml(brokenTierYaml);
+check("parse: unknown tier alias resolves empty", JSON.stringify(brokenParsed.advisors[0].tools), "[]");
+check(
+  "validate: unknown tier alias -> tools missing",
+  validateRoster({ sourcePath: "sample", sharedInstructions: "x", advisors: brokenParsed.advisors }).some(
+    (it) => it.message === "tools missing",
+  ),
+  true,
+);
+
+// Canonical 13-domain breadth fixture: exactly 100 roles, exact pins, all on
+// the broad common tier, proactive + notification shared contract, and no
+// forbidden tools anywhere. Mirrors the redesigned canonical roster shape.
+const CANONICAL_DOMAINS: [string, number][] = [
+  ["software/technical", 16],
+  ["product/business", 9],
+  ["finance/legal/admin", 8],
+  ["career/learning", 8],
+  ["health/wellbeing", 8],
+  ["relationships/communication", 7],
+  ["home/logistics", 7],
+  ["travel/local/world affairs", 7],
+  ["research/epistemics", 7],
+  ["security/privacy", 7],
+  ["creativity/writing", 5],
+  ["long-term planning", 5],
+  ["personal operations", 6],
+];
+const COMMON_TOOLS = [
+  "read",
+  "glob",
+  "grep",
+  "ast_grep",
+  "lsp",
+  "web_search",
+  "browser",
+  "computer",
+  "bash",
+  "edit",
+  "write",
+  "eval",
+  "debug",
+  "ast_edit",
+  "security_scan",
+  "inspect_image",
+  "todo",
+  "yield",
+];
+const FORBIDDEN_TOOLS = ["github", "task", "hub", "ask", "checkpoint", "retain", "recall", "reflect"];
+
+function buildCanonicalFixture(): string {
+  const lines: string[] = [];
+  lines.push("# fixture: canonical 13-domain proactive roster");
+  lines.push("x-tool-tiers:");
+  lines.push("  common: &common");
+  for (const tool of COMMON_TOOLS) lines.push(`    - ${tool}`);
+  lines.push("");
+  lines.push("instructions: |");
+  lines.push("  Evaluate every relevant turn without being asked. Silence is the spam control.");
+  lines.push("  Notify the main agent about every action and observation: any action taken, discovery, change, opportunity, or risk.");
+  lines.push("  Finance, legal, and health advisors give information and escalation only; they never decide, buy, sign, diagnose, or dose.");
+  lines.push("");
+  lines.push("advisors:");
+  for (const [domain, count] of CANONICAL_DOMAINS) {
+    const slug = domain.replace(/[^a-zA-Z0-9]+/g, "");
+    for (let k = 1; k <= count; k++) {
+      lines.push(`  - name: ${slug}${k}`);
+      lines.push(`    domain: ${domain}`);
+      lines.push("    enabled: true");
+      lines.push(`    model: ${ROSTER_MODEL}`);
+      lines.push("    tools: *common");
+      lines.push("    instructions: |");
+      lines.push(`      Remit: advise on ${domain}.`);
+      lines.push("      Activation: every relevant turn.");
+      lines.push("      Cadence: every relevant turn, one bundled note.");
+      lines.push("      Excludes/handoff: none.");
+      lines.push("      Tooling: no runtime tools in Pi; every requested action goes to the main agent.");
+    }
+  }
+  return lines.join("\n");
+}
+
+const fixture = parseRosterYaml(buildCanonicalFixture());
+check("fixture: exactly " + ROSTER_EXPECTED + " advisors", fixture.advisors.length, ROSTER_EXPECTED);
+check(
+  "fixture: zero validation issues",
+  validateRoster({ sourcePath: "fixture", sharedInstructions: fixture.sharedInstructions, advisors: fixture.advisors }).length,
+  0,
+);
+const domainCounts = new Map<string, number>();
+for (const advisor of fixture.advisors) {
+  const domain = advisor.domain ?? "(none)";
+  domainCounts.set(domain, (domainCounts.get(domain) ?? 0) + 1);
+}
+for (const [domain, count] of CANONICAL_DOMAINS) {
+  check(`fixture: domain ${domain} has ${count} advisors`, domainCounts.get(domain), count);
+}
+check("fixture: all advisors enabled", fixture.advisors.every((a) => a.enabled), true);
+check("fixture: all model pins exact", fixture.advisors.every((a) => a.model === ROSTER_MODEL), true);
+check(
+  "fixture: all tools resolve to the common tier",
+  fixture.advisors.every((a) => JSON.stringify(a.tools) === JSON.stringify(COMMON_TOOLS)),
+  true,
+);
+const fixtureToolSet = new Set<string>();
+for (const advisor of fixture.advisors) for (const tool of advisor.tools) fixtureToolSet.add(tool);
+check("fixture: no forbidden tools", FORBIDDEN_TOOLS.every((t) => !fixtureToolSet.has(t)), true);
+check(
+  "fixture: proactive shared contract",
+  fixture.sharedInstructions.includes("Evaluate every relevant turn without being asked"),
+  true,
+);
+check(
+  "fixture: notification contract in shared instructions",
+  fixture.sharedInstructions.includes("Notify the main agent about every action and observation"),
+  true,
+);
+check(
+  "fixture: high-impact limits in shared instructions",
+  fixture.sharedInstructions.includes("give information and escalation only"),
+  true,
+);
+
+// Live canonical roster (this machine): exactly 100 enabled, all pinned, all
+// resolved tools, no forbidden tools. Holds for both the current and the
+// redesigned canonical file shapes.
 const liveRoster = loadRoster();
 check("live roster loads from " + (liveRoster ? liveRoster.sourcePath : "(none)"), liveRoster !== null, true);
 if (liveRoster) {
@@ -351,13 +611,15 @@ if (liveRoster) {
     liveRoster.advisors.every((a) => a.model === ROSTER_MODEL),
     true,
   );
-  check("live roster: tools tier on all", liveRoster.advisors.every((a) => a.hasTools), true);
+  check("live roster: tools resolved on all", liveRoster.advisors.every((a) => a.tools.length > 0), true);
   check("live roster: zero validation issues", validateRoster(liveRoster).length, 0);
   check("live roster: shared contract non-empty", liveRoster.sharedInstructions.length > 100, true);
+  const liveToolSet = new Set<string>();
+  for (const advisor of liveRoster.advisors) for (const tool of advisor.tools) liveToolSet.add(tool);
+  check("live roster: no forbidden tools", FORBIDDEN_TOOLS.every((t) => !liveToolSet.has(t)), true);
 }
 
 // Surrogate pair safety: truncating an emoji must not split the pair.
-// (Kept above the summary/exit so these checks actually run.)
 const emoji = "a".repeat(3) + "😀" + "b".repeat(20);
 const cut = truncate(emoji, 6);
 check("truncate does not split surrogate pairs", /[\uD800-\uDBFF]$/.test(cut), false);

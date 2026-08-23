@@ -7,8 +7,12 @@
  * targeted parser instead of a YAML dependency. It is written for exactly
  * the canonical file's shape and is validated by test.ts.
  *
- * The Pi adapter grants advisors zero tools; the roster's `tools` tier is
- * read as a marker (present/absent) and never translated into runtime tools.
+ * The Pi adapter grants advisors zero tools. The roster's `x-tool-tiers`
+ * block is parsed into real tool-name lists (both the inline `t1: &t1 [a,b]`
+ * form and the block-sequence `common: &common` + `- a` form) and each
+ * advisor's `tools` reference is resolved to its names. Those names are used
+ * only for evidence and contract checks - never translated into runtime tools
+ * in Pi, where advisors stay read-only and request actions from the main agent.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -22,8 +26,11 @@ export interface AdvisorSpec {
   name: string;
   enabled: boolean;
   model: string;
-  /** true when the roster grants this advisor a canonical tool tier. */
-  hasTools: boolean;
+  /** Resolved tool names granted by the roster tier (e.g. "read", "grep").
+   *  Informational only in Pi: advisors never receive runtime tools. */
+  tools: string[];
+  /** Canonical life/work domain when the roster labels one (e.g. "health/wellbeing"). */
+  domain?: string;
   instructions: string;
 }
 
@@ -99,6 +106,52 @@ function dedentBlock(lines: string[]): string {
     .trim();
 }
 
+function splitTools(list: string): string[] {
+  return list
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Parse one `x-tool-tiers` line into the tier keys it declares and any
+ * inline tool list. Supports both canonical shapes:
+ *   - `t1: &t1 [read, glob, grep]`   inline array (old shape)
+ *   - `common: &common`              block header; tools follow as `- name`
+ *                                     lines (current canonical shape)
+ * Also accepts bare `&t1`, `t1: [a, b]`, `&t1 [a, b]`, and plain `t1:`.
+ * Returns null when the line is not a tier declaration.
+ */
+function parseTierLine(line: string): { keys: string[]; tools: string[] | null } | null {
+  const t = line.trim();
+  let m = t.match(/^([\w-]+):\s*&([\w-]+)\s*\[([^\]]*)\]\s*$/); // t1: &t1 [a,b]
+  if (m) return { keys: [m[1], m[2]], tools: splitTools(m[3]) };
+  m = t.match(/^&([\w-]+)\s*\[([^\]]*)\]\s*$/); // &t1 [a,b]
+  if (m) return { keys: [m[1]], tools: splitTools(m[2]) };
+  m = t.match(/^([\w-]+):\s*\[([^\]]*)\]\s*$/); // t1: [a,b]
+  if (m) return { keys: [m[1]], tools: splitTools(m[2]) };
+  m = t.match(/^([\w-]+):\s*&([\w-]+)\s*$/); // common: &common
+  if (m) return { keys: [m[1], m[2]], tools: null };
+  m = t.match(/^&([\w-]+)\s*$/); // &common
+  if (m) return { keys: [m[1]], tools: null };
+  m = t.match(/^([\w-]+):\s*$/); // common:
+  if (m) return { keys: [m[1]], tools: null };
+  return null;
+}
+
+/** Resolve an advisor's `tools:` value to tool names against the tier map. */
+function resolveTools(raw: string, tiers: Map<string, string[]>): string[] {
+  const v = raw.trim();
+  if (!v) return [];
+  if (v.startsWith("*")) return tiers.get(v.slice(1)) ?? [];
+  if (v.startsWith("[")) {
+    const close = v.lastIndexOf("]");
+    return splitTools(v.slice(1, close > 0 ? close : v.length));
+  }
+  if (tiers.has(v)) return tiers.get(v) ?? [];
+  return splitTools(v);
+}
+
 /**
  * Parse the canonical roster. Returns the shared `instructions` block and the
  * full advisor list. Tolerant of exact indentation: item keys are found by
@@ -107,6 +160,7 @@ function dedentBlock(lines: string[]): string {
 export function parseRosterYaml(text: string): { sharedInstructions: string; advisors: AdvisorSpec[] } {
   const lines = stripYamlComments(text).split("\n");
   const advisors: AdvisorSpec[] = [];
+  const tiers = new Map<string, string[]>();
   let sharedInstructions = "";
   let i = 0;
   while (i < lines.length) {
@@ -118,6 +172,42 @@ export function parseRosterYaml(text: string): { sharedInstructions: string; adv
       continue;
     }
     if (indent === 0) {
+      if (/^x-tool-tiers:\s*$/.test(trimmed)) {
+        // Collect every indented tier declaration below this key.
+        let k = i + 1;
+        let currentKeys: string[] = [];
+        let currentTools: string[] | null = null;
+        while (k < lines.length && indentOf(lines[k]) > 0) {
+          const l = lines[k];
+          if (l.trim() === "") {
+            k++;
+            continue;
+          }
+          const item = l.trim().match(/^-\s+(.+)$/);
+          if (item) {
+            // Block-sequence tier: append to the open tier's tools.
+            if (currentKeys.length) {
+              currentTools ??= [];
+              currentTools.push(item[1].trim());
+            }
+            k++;
+            continue;
+          }
+          // A new tier declaration closes the previous one.
+          if (currentKeys.length) {
+            for (const key of currentKeys) tiers.set(key, currentTools ?? []);
+          }
+          const header = parseTierLine(l);
+          currentKeys = header?.keys ?? [];
+          currentTools = header?.tools ?? null;
+          k++;
+        }
+        if (currentKeys.length) {
+          for (const key of currentKeys) tiers.set(key, currentTools ?? []);
+        }
+        i = k;
+        continue;
+      }
       if (/^instructions:\s*\|?[>-]?$/.test(trimmed)) {
         const parts: string[] = [];
         let k = i + 1;
@@ -143,7 +233,7 @@ export function parseRosterYaml(text: string): { sharedInstructions: string; adv
             i++;
             continue;
           }
-          const item: AdvisorSpec = { name: "", enabled: true, model: "", hasTools: false, instructions: "" };
+          const item: AdvisorSpec = { name: "", enabled: true, model: "", tools: [], instructions: "" };
           const inlineName = itemLine.trimStart().match(/^-\s*name:\s*(.+)$/);
           if (inlineName) item.name = inlineName[1].trim();
           // Find where this item's key block ends (next `- ` at same indent).
@@ -180,7 +270,8 @@ export function parseRosterYaml(text: string): { sharedInstructions: string; adv
               if (key === "name" && val) item.name = val;
               else if (key === "enabled") item.enabled = val.toLowerCase() === "true";
               else if (key === "model" && val) item.model = val;
-              else if (key === "tools") item.hasTools = true;
+              else if (key === "tools") item.tools = resolveTools(val, tiers);
+              else if (key === "domain" && val) item.domain = val;
               else if (key === "instructions") {
                 if (/[|][>-]?$/.test(val)) {
                   collectingInstructions = true;
@@ -221,7 +312,7 @@ export function loadRoster(filePath?: string): Roster | null {
 
 /**
  * Validate the canonical contract: exactly 100 advisors, all enabled, every
- * model pin byte-identical, unique names, a tools tier on each, and non-empty
+ * model pin byte-identical, unique names, resolved tools on each, and non-empty
  * shared plus per-advisor instructions.
  */
 export function validateRoster(roster: Roster): RosterIssue[] {
@@ -245,7 +336,7 @@ export function validateRoster(roster: Roster): RosterIssue[] {
     if (a.model !== ROSTER_MODEL) {
       issues.push({ advisor: a.name, message: `model '${a.model}' != '${ROSTER_MODEL}'` });
     }
-    if (!a.hasTools) issues.push({ advisor: a.name, message: "tools tier missing" });
+    if (a.tools.length === 0) issues.push({ advisor: a.name, message: "tools missing" });
     if (!a.instructions.trim()) issues.push({ advisor: a.name, message: "instructions missing" });
   }
   return issues;
