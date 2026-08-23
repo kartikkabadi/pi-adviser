@@ -1,19 +1,30 @@
+// Unit checks for adviser.ts pure helpers. Run: bun test.ts (from the repo root)
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-// Unit checks for adviser.ts pure helpers. Run: bun test.ts (from the repo root)
 import {
   applyCommand,
   buildInjection,
   buildPassInput,
+  combineNotes,
+  dedupeConcern,
+  effectiveModelPin,
   isStale,
   newestUserTimestamp,
   parseAdviserOutput,
+  parseModelPin,
   readConfig,
   toolResultText,
   truncate,
   writeConfig,
 } from "./adviser.ts";
+import {
+  loadRoster,
+  parseRosterYaml,
+  validateRoster,
+  ROSTER_MODEL,
+  ROSTER_EXPECTED,
+} from "./roster.ts";
 
 let failed = 0;
 function check(name: string, actual: unknown, expected: unknown): void {
@@ -213,6 +224,136 @@ try {
   check("non-boolean config defaults on", readConfig(cfgPath), true);
 } finally {
   rmSync(cfgDir, { recursive: true, force: true });
+}
+
+// combineNotes
+check("combineNotes joins with advisor tags", combineNotes([{ advisor: "Alpha", text: "hi" }]), "- [Alpha] hi");
+check(
+  "combineNotes caps overflow",
+  combineNotes([{ advisor: "A", text: "x".repeat(20) }, { advisor: "B", text: "y".repeat(20) }], 30),
+  "- [A] " + "x".repeat(20),
+);
+
+// dedupeConcern: unchanged advice is suppressed deterministically.
+const lastConcerns = new Map<string, string>();
+check("no-repeat: first concern delivered", dedupeConcern("A", "check X", lastConcerns), "check X");
+check("no-repeat: unchanged concern suppressed", dedupeConcern("A", "check X", lastConcerns), null);
+check("no-repeat: changed concern delivered", dedupeConcern("A", "check Y", lastConcerns), "check Y");
+check("no-repeat: repeat after change suppressed", dedupeConcern("A", "check Y", lastConcerns), null);
+check("no-repeat: independent per advisor", dedupeConcern("B", "check X", lastConcerns), "check X");
+
+// effectiveModelPin: the dev override never weakens the roster pin.
+check("model pin: no override uses pin", effectiveModelPin(ROSTER_MODEL, ""), ROSTER_MODEL);
+check("model pin: identical override honored", effectiveModelPin(ROSTER_MODEL, ROSTER_MODEL), ROSTER_MODEL);
+check("model pin: different model ignored", effectiveModelPin(ROSTER_MODEL, "other/provider:max"), ROSTER_MODEL);
+check("model pin: missing :max ignored", effectiveModelPin(ROSTER_MODEL, "particle/deepseek-v4-flash-0731"), ROSTER_MODEL);
+check("model pin: lower reasoning ignored", effectiveModelPin(ROSTER_MODEL, "particle/deepseek-v4-flash-0731:low"), ROSTER_MODEL);
+check("model pin: malformed spec rejected", effectiveModelPin("malformed", ""), null);
+check("parse pin: extracts reasoning", parseModelPin(ROSTER_MODEL)?.reasoning, "max");
+
+// Roster parser on a representative sample (anchors, block scalars, comments).
+const SAMPLE_YAML = [
+  "# comment outside block scalar",
+  "x-tool-tiers:",
+  "  &t1 [read, glob, grep]",
+  "instructions: |",
+  "  Shared contract with a # hash inside.",
+  "  Second line.",
+  "advisors:",
+  "  - name: AlphaAdvisor",
+  "    enabled: true",
+  "    model: particle/deepseek-v4-flash-0731:max",
+  "    tools: *t1",
+  "    instructions: |",
+  "      Alpha role line.",
+  "      # hash inside block survives.",
+  "  - name: BetaAdvisor",
+  "    enabled: true",
+  "    model: particle/deepseek-v4-flash-0731:max",
+  "    tools: *t1",
+  "    instructions: short",
+  "",
+].join("\n");
+const parsed = parseRosterYaml(SAMPLE_YAML);
+check("parse: two advisors", parsed.advisors.length, 2);
+check(
+  "parse: shared instructions keep # inside block",
+  parsed.sharedInstructions,
+  "Shared contract with a # hash inside.\nSecond line.",
+);
+check("parse: first advisor name", parsed.advisors[0].name, "AlphaAdvisor");
+check("parse: model pin", parsed.advisors[0].model, "particle/deepseek-v4-flash-0731:max");
+check("parse: tools marker", parsed.advisors[0].hasTools, true);
+check(
+  "parse: block instructions keep # inside block",
+  parsed.advisors[0].instructions,
+  "Alpha role line.\n# hash inside block survives.",
+);
+check("parse: inline instructions", parsed.advisors[1].instructions, "short");
+
+// Validator flags each contract violation.
+const badRoster = {
+  sourcePath: "sample",
+  sharedInstructions: "x",
+  advisors: [
+    { name: "", enabled: false, model: "other/model:max", hasTools: false, instructions: "" },
+    { name: "dup", enabled: true, model: ROSTER_MODEL, hasTools: true, instructions: "" },
+    { name: "dup", enabled: true, model: ROSTER_MODEL, hasTools: true, instructions: "" },
+  ],
+};
+const badIssues = validateRoster(badRoster);
+check("validate: count mismatch flagged", badIssues.some((it) => it.message.includes("expected " + ROSTER_EXPECTED)), true);
+check("validate: unnamed flagged", badIssues.some((it) => it.message.includes("missing or duplicate")), true);
+check("validate: duplicate flagged", badIssues.filter((it) => it.advisor === "dup").length >= 1, true);
+check("validate: not enabled flagged", badIssues.some((it) => it.message === "not enabled"), true);
+check("validate: wrong model flagged", badIssues.some((it) => it.message.includes("!=")), true);
+check("validate: missing tools flagged", badIssues.some((it) => it.message === "tools tier missing"), true);
+
+// Fail closed: missing shared or per-advisor instructions are rejections.
+const noSharedRoster = {
+  sourcePath: "sample",
+  sharedInstructions: "   ",
+  advisors: [
+    { name: "A", enabled: true, model: ROSTER_MODEL, hasTools: true, instructions: "x" },
+  ],
+};
+check(
+  "validate: missing shared instructions flagged",
+  validateRoster(noSharedRoster).some((it) => it.message === "shared instructions missing"),
+  true,
+);
+
+const noInstrRoster = {
+  sourcePath: "sample",
+  sharedInstructions: "x",
+  advisors: [
+    { name: "A", enabled: true, model: ROSTER_MODEL, hasTools: true, instructions: "" },
+  ],
+};
+check(
+  "validate: missing advisor instructions flagged",
+  validateRoster(noInstrRoster).some((it) => it.message === "instructions missing"),
+  true,
+);
+
+// Live canonical roster (this machine): exactly 100 enabled, all pinned.
+const liveRoster = loadRoster();
+check("live roster loads from " + (liveRoster ? liveRoster.sourcePath : "(none)"), liveRoster !== null, true);
+if (liveRoster) {
+  check("live roster: exactly " + ROSTER_EXPECTED + " advisors", liveRoster.advisors.length, ROSTER_EXPECTED);
+  check(
+    "live roster: all enabled",
+    liveRoster.advisors.filter((a) => a.enabled).length,
+    ROSTER_EXPECTED,
+  );
+  check(
+    "live roster: all model pins exact",
+    liveRoster.advisors.every((a) => a.model === ROSTER_MODEL),
+    true,
+  );
+  check("live roster: tools tier on all", liveRoster.advisors.every((a) => a.hasTools), true);
+  check("live roster: zero validation issues", validateRoster(liveRoster).length, 0);
+  check("live roster: shared contract non-empty", liveRoster.sharedInstructions.length > 100, true);
 }
 
 // Surrogate pair safety: truncating an emoji must not split the pair.

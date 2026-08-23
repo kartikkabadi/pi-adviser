@@ -1,24 +1,29 @@
 /**
- * adviser - a lean second-opinion reviewer for pi.
+ * adviser - the canonical 100-advisor roster as a pi extension.
  *
- * Watches what the main agent reads and runs, then asks it sharp questions
- * and checks - one model call per tool-bearing turn, injected into the
- * next LLM call. It never re-reads the conversation: each pass gets only
- * its own rolling digest (what it flagged before) plus the new tool output.
+ * On each tool-bearing turn, all roster advisors review the tool activity in
+ * parallel (small pool), each with its own rolling digest. Their notes are
+ * coalesced into one injected context message on the next LLM call.
+ *
+ * Advisors hold zero tools: they review only the pass input and report
+ * through their note. They never mutate anything; fixes are the main
+ * agent's job.
  *
  * Usage:
- *   - Installed: on by default. /adviser on|off - bare /adviser toggles. The state is
- *     saved to the agent config (adviser.json) and restored on every session start.
- *   - Config: PI_ADVISER_MODEL="provider/id" to pick a different model
- *     (default: the main agent's current model).
+ *   - Installed: on by default. /adviser on|off - bare /adviser toggles. The
+ *     state is saved to the agent config (adviser.json) and restored on every
+ *     session start; the command list always shows the live state.
+ *   - Config: PI_ADVISER_MODEL="provider/id:reasoning" to override the roster
+ *     pins (dev only; honored only when it resolves to the exact pinned model
+ *     and reasoning). PI_ADVISER_ROSTER=path to point at a WATCHDOG.yml copy.
  *   - Debug: PI_ADVISER_DEBUG=1 logs pass outcomes to stderr.
  *
  * Design rules:
  *   - Never blocks or interrupts the main agent.
- *   - One pass per turn, only when the turn had tool results.
- *   - No stale injections: each pass is stamped with its turn's end time;
+ *   - One coalesced wave per turn, only when the turn had tool results.
+ *   - No stale injections: each wave is stamped with its turn's end time;
  *     delivery is dropped once a newer user message has arrived.
- *   - Silence is the default: the adviser speaks only when something matters.
+ *   - Silence is the default: an advisor speaks only when something matters.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -30,6 +35,13 @@ import {
   type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import {
+  loadRoster,
+  resolveRosterPath,
+  validateRoster,
+  type AdvisorSpec,
+  type Roster,
+} from "./roster.ts";
 
 // ---------------------------------------------------------------------------
 // Config - the entire config surface.
@@ -43,8 +55,10 @@ const DEFAULT_ENABLED = true;
 
 const TOOL_RESULT_MAX_CHARS = 2000; // per tool result
 const PASS_INPUT_MAX_CHARS = 9000; // total tool activity per pass
-const CONCERNS_MAX_CHARS = 900; // injected note, hard cap
-const DIGEST_MAX_CHARS = 700; // adviser memory, hard cap
+const CONCERNS_MAX_CHARS = 900; // per-note cap
+const DIGEST_MAX_CHARS = 700; // per-advisor memory, hard cap
+const NOTES_MAX_CHARS = 3000; // combined injected notes, hard cap
+const PASS_CONCURRENCY = 8; // advisors in flight at once
 
 const SYSTEM_PROMPT = `You are Adviser, a second-opinion reviewer inside a coding agent session. You watch what the main agent reads and runs, and you flag real problems with sharp questions.
 
@@ -64,11 +78,13 @@ Reply with exactly one JSON object and no other text:
 // State.
 // ---------------------------------------------------------------------------
 
-let enabled = readConfig(CONFIG_PATH);
-let digest = ""; // adviser memory: what it flagged, what is open
-let pendingConcerns: string | null = null; // advice waiting for the next LLM call
-let pendingStamp = 0; // turn-end time of the turn the pending pass reviewed
-let passing = false; // coalescing: skip turns while a pass is in flight
+let enabled = readConfig(CONFIG_PATH); // default: on
+let roster: Roster | null = null; // canonical roster, loaded at session start
+const digests = new Map<string, string>(); // advisor name -> rolling memory
+const lastConcerns = new Map<string, string>(); // advisor name -> last delivered concern
+let pendingNotes: { advisor: string; text: string }[] | null = null; // waiting for the next LLM call
+let pendingStamp = 0; // turn-end time of the turn the pending wave reviewed
+let passing = false; // coalescing: skip turns while a wave is in flight
 let shutdown = false; // session is being torn down; stop touching ctx
 
 // ---------------------------------------------------------------------------
@@ -82,6 +98,25 @@ export function truncate(text: string, max: number): string {
   return text.slice(0, cut) + "\n...[truncated]";
 }
 
+/** Read the persisted on/off state. Missing or broken config -> default on. Exported for tests. */
+export function readConfig(path: string): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { enabled?: unknown };
+    return typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_ENABLED;
+  } catch {
+    return DEFAULT_ENABLED;
+  }
+}
+
+/** Persist the on/off state so new sessions restore it. Exported for tests. */
+export function writeConfig(path: string, enabled: boolean): void {
+  try {
+    writeFileSync(path, JSON.stringify({ enabled }, null, 2) + "\n");
+  } catch (error) {
+    log("error writing config:", error);
+  }
+}
+
 /** Extract text from a tool result's content parts. */
 export function toolResultText(content: { type: string; text?: string }[]): string {
   return content
@@ -90,7 +125,7 @@ export function toolResultText(content: { type: string; text?: string }[]): stri
     .join("");
 }
 
-/** Build the adviser's pass input: digest + new tool activity. */
+/** Build an advisor's pass input: its digest + new tool activity. */
 export function buildPassInput(
   digest: string,
   entries: { toolName: string; text: string }[],
@@ -105,7 +140,7 @@ export function buildPassInput(
 }
 
 /**
- * Parse the adviser's reply. Expects one JSON object {concerns, digest}.
+ * Parse an advisor's reply. Expects one JSON object {concerns, digest}.
  * Falls back to treating the whole reply as concerns when JSON is not
  * recoverable. Returns digest "" when the reply did not provide one.
  */
@@ -172,23 +207,31 @@ export function applyCommand(state: boolean, arg: string): boolean {
   return !state; // bare /adviser toggles
 }
 
-/** Read the persisted on/off state. Missing or broken config -> default on. Exported for tests. */
-export function readConfig(path: string): boolean {
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as { enabled?: unknown };
-    return typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_ENABLED;
-  } catch {
-    return DEFAULT_ENABLED;
+/** Combine per-advisor notes into one injected text, hard-capped. Exported for tests. */
+export function combineNotes(
+  notes: { advisor: string; text: string }[],
+  max = NOTES_MAX_CHARS,
+): string {
+  const lines: string[] = [];
+  let used = 0;
+  for (const note of notes) {
+    const line = `- [${note.advisor}] ${note.text}`;
+    if (used + line.length > max) break;
+    lines.push(line);
+    used += line.length + 1;
   }
+  return lines.join("\n");
 }
 
-/** Persist the on/off state so new sessions restore it. Exported for tests. */
-export function writeConfig(path: string, enabled: boolean): void {
-  try {
-    writeFileSync(path, JSON.stringify({ enabled }, null, 2) + "\n");
-  } catch (error) {
-    log("error writing config:", error);
-  }
+/**
+ * Deterministic no-repeat: an advisor's concern is suppressed when it is
+ * unchanged from the last one delivered. Returns the concern to deliver,
+ * or null when it is an unchanged repeat. Exported for tests.
+ */
+export function dedupeConcern(advisor: string, concerns: string, last: Map<string, string>): string | null {
+  if (last.get(advisor) === concerns) return null;
+  last.set(advisor, concerns);
+  return concerns;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,19 +242,78 @@ function log(...parts: unknown[]): void {
   if (DEBUG) console.error("[adviser]", ...parts);
 }
 
-function resolveModel(ctx: ExtensionContext) {
-  if (MODEL_OVERRIDE) {
-    const slash = MODEL_OVERRIDE.indexOf("/");
-    if (slash > 0 && slash < MODEL_OVERRIDE.length - 1) {
-      const model = ctx.modelRegistry.find(
-        MODEL_OVERRIDE.slice(0, slash),
-        MODEL_OVERRIDE.slice(slash + 1),
-      );
-      if (model) return model;
-      log("model override not found, falling back to main model:", MODEL_OVERRIDE);
+/**
+ * Parse a model pin "provider/model:reasoning" into its parts. The reasoning
+ * suffix is required so max thinking is always explicit. Returns null when
+ * the pin is malformed (fail closed - never guess a model). Exported for tests.
+ */
+export function parseModelPin(spec: string): { provider: string; modelId: string; reasoning: string } | null {
+  const slash = spec.indexOf("/");
+  if (slash <= 0 || slash >= spec.length - 1) return null;
+  const rest = spec.slice(slash + 1);
+  const colon = rest.lastIndexOf(":");
+  if (colon <= 0) return null;
+  return {
+    provider: spec.slice(0, slash),
+    modelId: rest.slice(0, colon),
+    reasoning: rest.slice(colon + 1),
+  };
+}
+
+/**
+ * The effective model pin for an advisor. The dev override (PI_ADVISER_MODEL)
+ * is honored only when it resolves to the exact same model and reasoning as
+ * the roster pin; any other override is ignored so runtime calls always use
+ * the required pin with max reasoning. Returns null on a malformed spec.
+ * Exported for tests.
+ */
+export function effectiveModelPin(spec: string, override: string): string | null {
+  const pin = parseModelPin(spec);
+  if (!pin) return null;
+  if (override) {
+    const candidate = parseModelPin(override);
+    if (
+      candidate &&
+      candidate.provider === pin.provider &&
+      candidate.modelId === pin.modelId &&
+      candidate.reasoning === pin.reasoning
+    ) {
+      return override;
     }
+    log("ignoring model override (does not match roster pin):", override);
   }
-  return ctx.model;
+  return spec;
+}
+
+/**
+ * Resolve a roster model pin like "particle/deepseek-v4-flash-0731:max".
+ * The ":max" suffix is the thinking level, passed as options.reasoning.
+ */
+function resolveRosterModel(ctx: ExtensionContext, spec: string): { model: unknown; reasoning: string } | null {
+  const target = effectiveModelPin(spec, MODEL_OVERRIDE);
+  if (!target) {
+    log("error: malformed roster model pin:", spec);
+    return null;
+  }
+  const pin = parseModelPin(target);
+  if (!pin) return null;
+  const model = ctx.modelRegistry.find(pin.provider, pin.modelId);
+  return model ? { model, reasoning: pin.reasoning } : null;
+}
+
+/** An advisor's system prompt: shared roster contract + its own role. */
+function buildAdvisorSystemPrompt(shared: string, advisor: AdvisorSpec): string {
+  return `${shared}
+
+Your role: ${advisor.name}.
+
+Role instructions:
+${advisor.instructions}
+
+Tools granted to you: none. You are read-only - you review only the tool activity shown in the pass input and report through your note. You never mutate anything; you only report observations for the main agent to act on.
+
+Reply with exactly one JSON object and no other text:
+{"concerns": "message to the main agent: one concrete issue, next action, drift, evidence gap, or milestone resolution, patch-anchored to the evidence that produced it. Empty string when nothing is worth saying. Max 150 words.", "digest": "your updated memory: findings, resolved status, open concerns. Max 100 words."}`;
 }
 
 function setWidget(ctx: ExtensionContext, lines: string[]): void {
@@ -223,25 +325,30 @@ function setWidget(ctx: ExtensionContext, lines: string[]): void {
   }
 }
 
-async function runPass(ctx: ExtensionContext, input: string, stamp: number): Promise<void> {
+/** One advisor reviewing the turn: its digest + the tool activity -> note or silence. */
+async function runAdvisorPass(
+  ctx: ExtensionContext,
+  advisor: AdvisorSpec,
+  sharedInstructions: string,
+  entries: { toolName: string; text: string }[],
+): Promise<{ advisor: string; text: string } | null> {
   try {
-    const model = resolveModel(ctx);
-    if (!model) {
-      log("error: no model available");
-      setWidget(ctx, ["adviser: error: no model available"]);
-      return;
+    const resolved = resolveRosterModel(ctx, advisor.model);
+    if (!resolved) {
+      log("error: no model for", advisor.name, advisor.model);
+      return null;
     }
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(resolved.model as never);
     if (!auth.apiKey) {
-      log("error: no api key for", model.id);
-      setWidget(ctx, ["adviser: error: no api key"]);
-      return;
+      log("error: no api key for", advisor.name);
+      return null;
     }
-    setWidget(ctx, ["adviser: reviewing the last tool activity..."]);
+    const prevDigest = digests.get(advisor.name) ?? "";
+    const input = buildPassInput(prevDigest, entries);
     const reply = await completeSimple(
-      model,
+      resolved.model as never,
       {
-        systemPrompt: SYSTEM_PROMPT,
+        systemPrompt: buildAdvisorSystemPrompt(sharedInstructions, advisor),
         messages: [
           {
             role: "user",
@@ -250,44 +357,90 @@ async function runPass(ctx: ExtensionContext, input: string, stamp: number): Pro
           },
         ],
       },
-      { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        signal: ctx.signal,
+        reasoning: resolved.reasoning,
+      },
     );
-    if (shutdown) return; // session ended while the adviser was thinking
+    if (shutdown) return null; // session ended while an advisor was thinking
     const replyText = reply.content
       .filter((part) => part.type === "text")
       .map((part) => part.text)
       .join("");
     const result = parseAdviserOutput(replyText);
-    if (result.digest) digest = result.digest;
-    if (result.concerns) {
-      pendingConcerns = result.concerns;
-      pendingStamp = stamp;
-      setWidget(ctx, [
-        "adviser: flagged - questions will reach the agent",
-        truncate(pendingConcerns, 160),
-      ]);
-      log("flagged:", pendingConcerns);
-    } else {
-      setWidget(ctx, ["adviser: nothing to flag"]);
-      log("clean");
-    }
+    if (result.digest) digests.set(advisor.name, result.digest);
+    if (!result.concerns) return null;
+    const text = dedupeConcern(advisor.name, result.concerns, lastConcerns);
+    return text ? { advisor: advisor.name, text } : null;
   } catch (error) {
+    log("advisor error:", advisor.name, error);
+    return null;
+  }
+}
+
+/** Review the turn with all roster advisors, pooled, then queue their notes. */
+async function runRosterPass(
+  ctx: ExtensionContext,
+  entries: { toolName: string; text: string }[],
+  stamp: number,
+): Promise<void> {
+  const list = roster?.advisors ?? [];
+  const shared = roster?.sharedInstructions ?? "";
+  if (list.length === 0) {
+    setWidget(ctx, ["adviser: error: roster has no advisors"]);
+    return;
+  }
+  setWidget(ctx, [`adviser: ${list.length} advisors reviewing the last tool activity...`]);
+  const notes: { advisor: string; text: string }[] = [];
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < list.length) {
+      const index = cursor++;
+      const note = await runAdvisorPass(ctx, list[index], shared, entries);
+      if (note) notes.push(note);
+    }
+  };
+  const pool = Math.min(PASS_CONCURRENCY, list.length);
+  await Promise.all(Array.from({ length: pool }, () => worker()));
+  if (shutdown) return;
+  if (notes.length) {
+    pendingNotes = notes;
+    pendingStamp = stamp;
     setWidget(ctx, [
-      "adviser: error: " + (error instanceof Error ? error.message : String(error)).slice(0, 80),
+      `adviser: ${notes.length} of ${list.length} advisors flagged`,
+      truncate(combineNotes(notes), 160),
     ]);
-    log("error:", error);
+    log("flagged", notes.length, "note(s)");
+  } else {
+    setWidget(ctx, [`adviser: ${list.length} advisors, nothing to flag`]);
+    log("clean");
   }
 }
 
 export default function (pi: ExtensionAPI): void {
-  // New session (or reload): the adviser memory is per-conversation.
+  // New session (or reload): the roster is per-machine, memory is per-conversation.
   pi.on("session_start", () => {
     enabled = readConfig(CONFIG_PATH); // restore the saved state; it persists across sessions
-    digest = "";
-    pendingConcerns = null;
+    digests.clear();
+    lastConcerns.clear();
+    pendingNotes = null;
     pendingStamp = 0;
     passing = false;
     shutdown = false;
+    roster = loadRoster();
+    if (roster) {
+      const issues = validateRoster(roster);
+      if (issues.length > 0) {
+        log("error: invalid roster rejected:", issues.map((it) => it.message).join("; "));
+        roster = null; // fail closed: never run advisors on incomplete/malformed roster data
+      } else {
+        log("roster loaded:", roster.sourcePath, "-", roster.advisors.length, "advisors");
+      }
+    } else {
+      log("error: no roster at", resolveRosterPath());
+    }
     syncAdviserCommand(); // reflect the restored state in the command list
   });
 
@@ -296,9 +449,13 @@ export default function (pi: ExtensionAPI): void {
     shutdown = true;
   });
 
-  // Trigger: one pass per turn, only when the turn produced tool results.
+  // Trigger: one coalesced wave per turn, only when the turn produced tool results.
   pi.on("turn_end", (event: TurnEndEvent, ctx: ExtensionContext) => {
     if (!enabled || passing) return;
+    if (!roster) {
+      setWidget(ctx, ["adviser: error: no roster - set PI_ADVISER_ROSTER"]);
+      return;
+    }
     const entries: { toolName: string; text: string }[] = [];
     for (const result of event.toolResults) {
       const text = toolResultText(result.content as { type: string; text?: string }[]);
@@ -306,27 +463,26 @@ export default function (pi: ExtensionAPI): void {
     }
     if (entries.length === 0) return;
     passing = true;
-    const stamp = Date.now(); // the turn this pass reviews
-    const input = buildPassInput(digest, entries);
-    void runPass(ctx, input, stamp).finally(() => {
+    const stamp = Date.now(); // the turn this wave reviews
+    void runRosterPass(ctx, entries, stamp).finally(() => {
       passing = false;
     });
   });
 
-  // Delivery: the next LLM call sees the pending advice once, then it clears.
-  // Stale advice is dropped: if a newer user message has arrived since the
+  // Delivery: the next LLM call sees the pending notes once, then they clear.
+  // Stale notes are dropped: if a newer user message has arrived since the
   // reviewed turn ended, the agent has moved on. Silence is the default.
   pi.on("context", (event, ctx: ExtensionContext) => {
-    if (!pendingConcerns) return;
+    if (!pendingNotes || pendingNotes.length === 0) return;
     if (isStale(event.messages, pendingStamp)) {
-      pendingConcerns = null;
-      log("dropped stale concerns (user moved on)");
+      pendingNotes = null;
+      log("dropped stale notes (user moved on)");
       return;
     }
-    const concerns = pendingConcerns;
-    pendingConcerns = null;
-    log("delivered to next LLM call");
-    return { messages: [...event.messages, buildInjection(concerns)] };
+    const notes = pendingNotes;
+    pendingNotes = null;
+    log("delivered", notes.length, "note(s) to next LLM call");
+    return { messages: [...event.messages, buildInjection(combineNotes(notes))] };
   });
 
   // The on/off switch. Bare /adviser toggles; on/off set explicitly.
@@ -335,13 +491,13 @@ export default function (pi: ExtensionAPI): void {
   const adviserHandler = async (args: string | undefined, ctx: ExtensionCommandContext) => {
     const on = applyCommand(enabled, args ?? "");
     if (!on) {
-      pendingConcerns = null;
+      pendingNotes = null; // never deliver advice while off
       pendingStamp = 0;
     }
     enabled = on;
     writeConfig(CONFIG_PATH, enabled); // persist so new sessions keep the state
     if (enabled) {
-      setWidget(ctx, ["adviser: on"]);
+      setWidget(ctx, roster ? [`adviser: on (${roster.advisors.length} advisors)`] : ["adviser: on (roster not loaded)"]);
       ctx.ui.notify("Adviser on", "info");
     } else {
       setWidget(ctx, []);
