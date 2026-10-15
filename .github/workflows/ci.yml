@@ -20,3 +20,4 @@ jobs:
         env:
           PI_ADVISER_ROSTER: ${{ github.workspace }}/.ci/omp-advisors/WATCHDOG.yml
       - run: bun roster-regression.ts
+      - run: bun roster-hash-regression.ts
