@@ -25,8 +25,8 @@
  *     delivery is dropped once a newer user message has arrived.
  *   - Silence is the default: an advisor speaks only when something matters.
  */
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
   getAgentDir,
   type ExtensionAPI,
@@ -111,6 +111,7 @@ export function readConfig(path: string): boolean {
 /** Persist the on/off state so new sessions restore it. Exported for tests. */
 export function writeConfig(path: string, enabled: boolean): void {
   try {
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ enabled }, null, 2) + "\n");
   } catch (error) {
     log("error writing config:", error);
