@@ -75,7 +75,7 @@ function stripYamlComments(text: string): string {
       }
       inBlock = false;
     }
-    const stripped = raw.replace(/\s*#.*$/, "").replace(/\s+$/, "");
+    const stripped = raw.replace(/(^|\s+)#.*$/, "").replace(/\s+$/, "");
     if (/[|][>-]?$/.test(stripped)) {
       inBlock = true;
       blockIndent = indentOf(stripped);
