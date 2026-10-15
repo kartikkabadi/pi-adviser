@@ -9,7 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kartikkabadi/omp-advisors
+          ref: 3f6873d6a157e4adcde4e8511089106640bd2a16
+          path: .ci/omp-advisors
       - uses: oven-sh/setup-bun@v2
       - run: bun install
       - run: bun test.ts
+        env:
+          PI_ADVISER_ROSTER: ${{ github.workspace }}/.ci/omp-advisors/WATCHDOG.yml
       - run: bun roster-regression.ts
