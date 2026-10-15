@@ -214,6 +214,9 @@ const cfgDir = mkdtempSync(join(tmpdir(), "adviser-test-"));
 try {
   const cfgPath = join(cfgDir, "adviser.json");
   check("missing config defaults on", readConfig(join(cfgDir, "nope.json")), true);
+  const nestedConfig = join(cfgDir, "nested", "adviser.json");
+  writeConfig(nestedConfig, false);
+  check("config persists in a new parent directory", readConfig(nestedConfig), false);
   writeConfig(cfgPath, false);
   check("written off reads back", readConfig(cfgPath), false);
   writeConfig(cfgPath, true);
